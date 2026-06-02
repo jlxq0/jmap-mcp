@@ -1,0 +1,94 @@
+[package]
+name = "jmap-mcp"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.93"
+description = "Remote MCP server exposing a Stalwart JMAP mailbox to claude.ai"
+license = "MIT"
+repository = "https://github.com/jlxq0/jmap-mcp"
+publish = false
+
+[dependencies]
+tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "rt", "signal", "net", "time"] }
+axum = "0.7"
+# `axum-extra` kept for parity with the matrix-mcp router shape (typed
+# cookie/Form extractors), used by the optional static /setup docs page.
+axum-extra = { version = "0.9", features = ["cookie"] }
+base64 = "0.22"
+# Prometheus metrics, text-format only (drops the vulnerable protobuf 2.x dep).
+prometheus = { version = "0.13", default-features = false }
+# Token-bucket rate limiting. Per-identity buckets keyed on sha256(bearer)[..16]
+# and on the Logto `sub`.
+governor = "0.7"
+http = "1"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# OpenTelemetry tracing export. Active only when OTEL_EXPORTER_OTLP_ENDPOINT
+# is set. Version skew is real: tracing-opentelemetry 0.32 <-> opentelemetry
+# 0.31 — do not bump independently.
+tracing-opentelemetry = "0.32"
+opentelemetry = "0.31"
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "2.0"
+# rustls-only HTTP client for JMAP calls to Stalwart, JWKS fetch from Logto,
+# and SSRF-guarded outbound URL fetches.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# SHA-256 of access tokens for cache keys — never store the raw token as a key.
+sha2 = "0.10"
+# Constant-time scheme comparison in the bearer extractor.
+subtle = "2.6"
+# Random suffixes for JMAP method call ids / Message-ID generation.
+rand = "0.8"
+# Logto access-token validation: RS256 JWT signature + aud/exp checks against
+# the JWKS published at {authorization_server}/jwks.
+jsonwebtoken = "9.3"
+# Official MCP Rust SDK. `transport-streamable-http-server` enables the
+# session manager + http transport we mount via `Router::nest_service`.
+# rmcp re-exports `schemars` (1.x) — we use `rmcp::schemars`, never a
+# separately-versioned schemars dep.
+rmcp = { version = "1.7", features = ["transport-streamable-http-server"] }
+# `futures` is transitive via rmcp; listed so session.rs can name `Stream`.
+futures = { version = "0.3", default-features = false }
+# Hex-encode token-hash cache keys + audit hashes.
+hex = "0.4"
+# MIME parsing for attachment / upload content-type handling.
+mime = "0.3"
+# URL parsing for SSRF guard + download/upload template expansion.
+url = "2.5"
+
+[dev-dependencies]
+# Mock Stalwart JMAP + Logto JWKS endpoints in integration tests.
+wiremock = "0.6"
+tempfile = "3"
+
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "warn"
+unimplemented = "warn"
+todo = "warn"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[lints.rust]
+unsafe_code = "forbid"
