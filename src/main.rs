@@ -72,7 +72,10 @@ async fn main() -> Result<()> {
 
 fn build_app(cfg: Config) -> Result<Router> {
     let logto = LogtoValidationClient::new(&cfg.authorization_server, cfg.resource_url.clone())?;
-    let jmap = JmapClient::new(&cfg.stalwart_jmap_base_url)?;
+    let jmap = JmapClient::new(
+        &cfg.stalwart_jmap_base_url,
+        cfg.stalwart_connect_ip.as_deref(),
+    )?;
     let auth_state = AuthState {
         config: cfg.clone(),
         logto: logto.clone(),
@@ -272,7 +275,7 @@ mod tests {
     fn router(cfg: Config) -> Router {
         let logto = LogtoValidationClient::new(&cfg.authorization_server, cfg.resource_url.clone())
             .unwrap();
-        let jmap = JmapClient::new(&cfg.stalwart_jmap_base_url).unwrap();
+        let jmap = JmapClient::new(&cfg.stalwart_jmap_base_url, None).unwrap();
         let auth_state = AuthState {
             config: cfg.clone(),
             logto: logto.clone(),

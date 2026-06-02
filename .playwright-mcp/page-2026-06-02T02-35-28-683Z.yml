@@ -1,0 +1,25 @@
+- main [ref=e3]:
+  - generic [ref=e32]:
+    - button "Back" [ref=e34] [cursor=pointer]:
+      - img [ref=e35]
+      - generic [ref=e37]: Back
+    - generic [ref=e38]:
+      - generic [ref=e39]:
+        - generic [ref=e40]: Enter password
+        - generic [ref=e41]: Sign in with the password to username alice
+      - generic [ref=e42]:
+        - generic [ref=e44]:
+          - generic [ref=e45]:
+            - textbox [active] [ref=e46]
+            - button [ref=e47] [cursor=pointer]:
+              - img [ref=e48]
+          - generic:
+            - group
+            - group
+            - generic: Password
+        - button "Continue" [ref=e50] [cursor=pointer]:
+          - generic [ref=e51]: Continue
+  - link "Powered By Logto" [ref=e17] [cursor=pointer]:
+    - /url: https://logto.io/?utm_source=sign_in&utm_medium=powered_by
+    - generic [ref=e18]: Powered by
+    - img [ref=e19]

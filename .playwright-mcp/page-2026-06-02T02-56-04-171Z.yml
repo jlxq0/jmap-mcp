@@ -1,0 +1,26 @@
+- main [ref=e3]:
+  - generic [ref=e4]:
+    - generic [ref=e5]:
+      - img "app logo" [ref=e7]
+      - generic [ref=e8]: Sign in to your account
+    - generic [ref=e9]:
+      - generic [ref=e11]:
+        - generic [ref=e12]:
+          - generic:
+            - button "+1":
+              - generic: "+1"
+              - img
+          - textbox [ref=e13]
+        - generic:
+          - group "Username / Email"
+          - generic: Username / Email
+      - button "Sign in" [ref=e14] [cursor=pointer]:
+        - generic [ref=e15]: Sign in
+    - generic [ref=e16]:
+      - text: No account yet?
+      - link "Create account" [ref=e17] [cursor=pointer]:
+        - /url: /register?app_id=erusxsrdgbmkzsh57ykap
+  - link "Powered By Logto" [ref=e19] [cursor=pointer]:
+    - /url: https://logto.io/?utm_source=sign_in&utm_medium=powered_by
+    - generic [ref=e20]: Powered by
+    - img [ref=e21]

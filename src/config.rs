@@ -48,6 +48,11 @@ const ENV_DOWNLOAD_MAX_BYTES: &str = "JMAP_MCP_DOWNLOAD_MAX_BYTES";
 pub const ENV_UPLOAD_MAX_BYTES: &str = "JMAP_MCP_UPLOAD_MAX_BYTES";
 /// Number of trusted proxies in front of jmap-mcp. Default 1 (Traefik).
 const ENV_TRUSTED_PROXY_HOPS: &str = "JMAP_MCP_TRUSTED_PROXY_HOPS";
+/// Optional IP to connect to when reaching the Stalwart host, overriding DNS.
+/// Used in-cluster to avoid hairpin NAT on the public `LoadBalancer`: we keep
+/// `Host` = the public hostname (so TLS + JMAP session URLs stay valid) but
+/// dial the in-cluster Service `ClusterIP` on port 443.
+const ENV_STALWART_CONNECT_IP: &str = "JMAP_MCP_STALWART_CONNECT_IP";
 
 const DEFAULT_RATE_LIMIT_READS: u32 = 60;
 const DEFAULT_RATE_LIMIT_WRITES: u32 = 30;
@@ -82,6 +87,9 @@ pub struct Config {
     pub upload_max_bytes: usize,
     /// Number of trusted proxies in front of jmap-mcp (X-Forwarded-For).
     pub trusted_proxy_hops: usize,
+    /// Optional IP to dial for the Stalwart host (DNS override). `None` = use
+    /// normal DNS resolution.
+    pub stalwart_connect_ip: Option<String>,
 }
 
 #[derive(Clone)]
@@ -127,6 +135,7 @@ impl Config {
             download_max_bytes: DEFAULT_DOWNLOAD_MAX_BYTES,
             upload_max_bytes: DEFAULT_UPLOAD_MAX_BYTES,
             trusted_proxy_hops: DEFAULT_TRUSTED_PROXY_HOPS,
+            stalwart_connect_ip: None,
         })
     }
 
@@ -170,6 +179,9 @@ impl Config {
         )?)
         .unwrap_or(DEFAULT_UPLOAD_MAX_BYTES);
         cfg.trusted_proxy_hops = parse_trusted_proxy_hops()?;
+        cfg.stalwart_connect_ip = std::env::var(ENV_STALWART_CONNECT_IP)
+            .ok()
+            .filter(|s| !s.trim().is_empty());
 
         // Optional opaque-token introspection fallback credentials.
         if let (Ok(client_id), Ok(client_secret)) = (

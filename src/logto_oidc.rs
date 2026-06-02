@@ -183,7 +183,27 @@ impl LogtoValidationClient {
             return Ok(None);
         };
 
-        let mut validation = Validation::new(Algorithm::RS256);
+        // jsonwebtoken requires every entry in `validation.algorithms` to
+        // share the key's family (mixing EC + RSA errors out), so we can't
+        // hardcode a cross-family list. Use the token header's declared `alg`
+        // — but only after allow-listing it to the asymmetric algorithms we
+        // accept (rejects `none`/HMAC and blocks alg-confusion). The key is
+        // already pinned by `kid` from the trusted JWKS and the signature is
+        // verified against it below, and jsonwebtoken enforces key.family ==
+        // alg.family, so a forged cross-family `alg` cannot validate.
+        if !matches!(
+            header.alg,
+            Algorithm::ES384
+                | Algorithm::ES256
+                | Algorithm::RS256
+                | Algorithm::RS384
+                | Algorithm::RS512
+                | Algorithm::EdDSA
+        ) {
+            warn!(alg = ?header.alg, "unsupported token signing algorithm; rejecting");
+            return Ok(None);
+        }
+        let mut validation = Validation::new(header.alg);
         validation.set_audience(&[&self.expected_audience]);
         validation.set_issuer(&[&self.expected_issuer]);
         validation.set_required_spec_claims(&["exp", "aud", "iss", "sub"]);

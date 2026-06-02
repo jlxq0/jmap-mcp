@@ -105,15 +105,27 @@ struct CachedSession {
 
 impl JmapClient {
     /// `stalwart_base` is the Stalwart host base; the JMAP session resource
-    /// is discovered at `{base}/.well-known/jmap`.
-    pub fn new(stalwart_base: &str) -> Result<Self> {
+    /// is discovered at `{base}/.well-known/jmap`. When `connect_ip` is set,
+    /// DNS for the base host is overridden to that IP on port 443 — keeping
+    /// `Host`/SNI = the public hostname (TLS + session URLs stay valid) while
+    /// dialling the in-cluster Service IP to avoid `LoadBalancer` hairpin NAT.
+    pub fn new(stalwart_base: &str, connect_ip: Option<&str>) -> Result<Self> {
         let base = stalwart_base.trim_end_matches('/');
         let discovery_url = format!("{base}/.well-known/jmap");
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
-            .user_agent(concat!("jmap-mcp/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .context("build reqwest client")?;
+            .user_agent(concat!("jmap-mcp/", env!("CARGO_PKG_VERSION")));
+        if let Some(ip) = connect_ip {
+            let host = url::Url::parse(base)
+                .ok()
+                .and_then(|u| u.host_str().map(ToOwned::to_owned))
+                .context("cannot parse host from Stalwart base URL for connect-IP override")?;
+            let addr: std::net::IpAddr = ip
+                .parse()
+                .context("JMAP_MCP_STALWART_CONNECT_IP is not a valid IP")?;
+            builder = builder.resolve(&host, std::net::SocketAddr::new(addr, 443));
+        }
+        let http = builder.build().context("build reqwest client")?;
         Ok(Self {
             http,
             discovery_url,
