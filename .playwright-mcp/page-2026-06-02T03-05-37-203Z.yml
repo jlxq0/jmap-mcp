@@ -1,0 +1,20 @@
+- generic [active] [ref=e1]:
+  - status [ref=e3]:
+    - img [ref=e4]
+    - paragraph [ref=e6]: Completing sign in...
+  - alert [ref=e7]
+  - status
+  - generic [ref=e8]:
+    - generic [ref=e9]:
+      - generic [ref=e10]:
+        - img "Kampong Social Club E-mail" [ref=e11]
+        - generic [ref=e12]:
+          - heading "Install Kampong Social Club E-mail" [level=3] [ref=e13]
+          - paragraph [ref=e14]: Install our app for quick access and offline support.
+      - button "Dismiss install prompt" [ref=e15]:
+        - img [ref=e16]
+    - generic [ref=e19]:
+      - generic [ref=e20]:
+        - button "Not now" [ref=e21]
+        - button "Install" [ref=e22]
+      - button "Don't remind me again" [ref=e23]

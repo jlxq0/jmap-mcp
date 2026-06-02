@@ -560,7 +560,7 @@ impl JmapMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "get_identities",
@@ -611,7 +611,7 @@ impl JmapMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "list_mailboxes",
@@ -699,7 +699,7 @@ impl JmapMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "list_recent_emails",

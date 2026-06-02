@@ -353,7 +353,7 @@ impl JmapMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "search_emails",
@@ -465,7 +465,7 @@ impl JmapMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "read_thread",
@@ -548,7 +548,7 @@ impl JmapMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "get_unread_summary",
@@ -614,7 +614,7 @@ impl JmapMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "list_recent_activity",
@@ -785,7 +785,7 @@ impl JmapMcpService {
         }
         .instrument(span.clone())
         .await
-        .map_or_else(|e| (Err(e), 0), |(r, c)| (r, c));
+        .unwrap_or_else(|e| (Err(e), 0));
         self.react_to_auth_expiry(&ctx, &mut result).await;
         emit_tool_audit(
             "list_attachments",
