@@ -53,9 +53,10 @@ jobs:
     permissions: { contents: read, packages: write }
     env:
       # The job runs inside a container; the VM's own LAN IP is unroutable from
-      # there. host.docker.internal is the stable Docker bridge gateway → the
-      # runner host, so this needs no edits across reboots/DHCP changes or repos.
-      BUILDKIT_HOST: tcp://host.docker.internal:1234
+      # there and changes on every DHCP lease. 172.17.0.1 is the Docker bridge
+      # gateway = the runner host — a constant, identical in every repo, stable
+      # across reboots. buildkitd binds 0.0.0.0:1234 so it's listening there.
+      BUILDKIT_HOST: tcp://172.17.0.1:1234
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with: { persist-credentials: false }
