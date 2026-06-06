@@ -52,7 +52,7 @@ jobs:
     needs: cargo
     permissions: { contents: read, packages: write }
     env:
-      BUILDKIT_HOST: tcp://10.0.1.57:1234
+      BUILDKIT_HOST: tcp://10.0.10.252:1234
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with: { persist-credentials: false }
