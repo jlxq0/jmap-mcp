@@ -37,6 +37,12 @@ const ENV_POD_IP: &str = "POD_IP";
 const ENV_INTROSPECTION_CLIENT_ID: &str = "JMAP_MCP_LOGTO_CLIENT_ID";
 /// Optional client secret paired with the id above.
 const ENV_INTROSPECTION_CLIENT_SECRET: &str = "JMAP_MCP_LOGTO_CLIENT_SECRET";
+
+/// Pre-provisioned Logto `client_id` handed back by the RFC 7591 dynamic client
+/// registration shim. Logto has no DCR endpoint, so claude.ai (which only
+/// onboards via DCR) gets this static public-SPA client. When unset, the
+/// `/register` endpoint and `registration_endpoint` advertisement are disabled.
+const ENV_DCR_CLIENT_ID: &str = "JMAP_MCP_DCR_CLIENT_ID";
 /// Per-identity read quota (per minute).
 const ENV_RATE_LIMIT_READS: &str = "JMAP_MCP_RATE_LIMIT_READS_PER_MIN";
 /// Per-identity write quota (per minute).
@@ -90,6 +96,9 @@ pub struct Config {
     /// Optional IP to dial for the Stalwart host (DNS override). `None` = use
     /// normal DNS resolution.
     pub stalwart_connect_ip: Option<String>,
+    /// Optional static Logto `client_id` returned by the DCR shim (`/register`).
+    /// `None` disables dynamic client registration advertisement.
+    pub dcr_client_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -136,6 +145,7 @@ impl Config {
             upload_max_bytes: DEFAULT_UPLOAD_MAX_BYTES,
             trusted_proxy_hops: DEFAULT_TRUSTED_PROXY_HOPS,
             stalwart_connect_ip: None,
+            dcr_client_id: None,
         })
     }
 
@@ -180,6 +190,9 @@ impl Config {
         .unwrap_or(DEFAULT_UPLOAD_MAX_BYTES);
         cfg.trusted_proxy_hops = parse_trusted_proxy_hops()?;
         cfg.stalwart_connect_ip = std::env::var(ENV_STALWART_CONNECT_IP)
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        cfg.dcr_client_id = std::env::var(ENV_DCR_CLIENT_ID)
             .ok()
             .filter(|s| !s.trim().is_empty());
 

@@ -31,7 +31,7 @@ use axum::extract::State;
 use axum::http::{Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
@@ -42,7 +42,7 @@ use crate::config::Config;
 use crate::jmap_client::JmapClient;
 use crate::logto_oidc::LogtoValidationClient;
 use crate::mcp::JmapMcpService;
-use crate::oauth_metadata::protected_resource_metadata;
+use crate::oauth_metadata::{authorization_server_metadata, protected_resource_metadata, register};
 use crate::rate_limit::{InitializeLimiter, Limiter, MAX_INITIALIZES_PER_IDENTITY};
 
 #[tokio::main]
@@ -153,6 +153,14 @@ fn build_router(
             "/.well-known/oauth-protected-resource",
             get(protected_resource_metadata),
         )
+        // Authorization-server metadata (RFC 8414) + DCR shim (RFC 7591) that
+        // front Logto so claude.ai's connector can self-register. Public — the
+        // OAuth dance happens before any bearer exists.
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(authorization_server_metadata),
+        )
+        .route("/register", post(register))
         .merge(mcp_routes)
         .layer(TraceLayer::new_for_http())
         .with_state(cfg)
