@@ -79,7 +79,9 @@ jobs:
           # buildkitd runs on the runner host, listening on 0.0.0.0:1234. From
           # inside this job container the host is our own bridge gateway — never
           # a hardcoded IP (those change on reboot/DHCP and differ per repo).
-          GW="$(ip route | awk '/^default/{print $3; exit}')"
+          # The image is slim (no iproute2), so read the default route from
+          # /proc/net/route via node (always present — actions run on it).
+          GW="$(node -e 'const fs=require("fs");for(const l of fs.readFileSync("/proc/net/route","utf8").split("\n").slice(1)){const f=l.trim().split(/\s+/);if(f[1]==="00000000"){const h=f[2];console.log([h.slice(6,8),h.slice(4,6),h.slice(2,4),h.slice(0,2)].map(x=>parseInt(x,16)).join("."));break;}}')"
           export BUILDKIT_HOST="tcp://${GW}:1234"
           echo "buildkitd at ${BUILDKIT_HOST}"
           CACHE_REF="forge.oddie.app/jlxq0/jmap-mcp:buildcache"
