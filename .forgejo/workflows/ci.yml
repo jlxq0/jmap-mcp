@@ -52,7 +52,10 @@ jobs:
     needs: cargo
     permissions: { contents: read, packages: write }
     env:
-      BUILDKIT_HOST: tcp://10.0.10.252:1234
+      # The job runs inside a container; the VM's own LAN IP is unroutable from
+      # there. host.docker.internal is the stable Docker bridge gateway → the
+      # runner host, so this needs no edits across reboots/DHCP changes or repos.
+      BUILDKIT_HOST: tcp://host.docker.internal:1234
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with: { persist-credentials: false }
