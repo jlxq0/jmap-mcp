@@ -440,9 +440,7 @@ impl JmapMcpService {
                 .map(|e| {
                     let id = str_field(e, "id").unwrap_or_default();
                     let mut raw_body = extract_text_body(e);
-                    if raw_body.len() > MAX_TEXT_BODY_BYTES {
-                        raw_body.truncate(MAX_TEXT_BODY_BYTES);
-                    }
+                    truncate_text_body(&mut raw_body);
                     let from = addrs(e, "from");
                     let verdict = crate::content_sandbox::evaluate(
                         None,

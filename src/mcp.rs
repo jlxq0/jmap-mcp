@@ -292,6 +292,24 @@ fn addrs(email: &Value, field: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Cap an untrusted email body at `MAX_TEXT_BODY_BYTES`, backing off to the
+/// nearest lower UTF-8 char boundary. `String::truncate` panics if the cut
+/// index lands inside a multi-byte character; with release `panic = "abort"`
+/// that aborts the whole server. A body of `MAX_TEXT_BODY_BYTES - 1` ASCII
+/// bytes followed by a 2-byte char (deliverable by any external sender) hits
+/// exactly that case, so this must be boundary-safe.
+fn truncate_text_body(body: &mut String) {
+    if body.len() <= MAX_TEXT_BODY_BYTES {
+        return;
+    }
+    let mut cap = MAX_TEXT_BODY_BYTES;
+    // `is_char_boundary(0)` is always true, so this terminates.
+    while !body.is_char_boundary(cap) {
+        cap -= 1;
+    }
+    body.truncate(cap);
+}
+
 fn str_field(email: &Value, field: &str) -> Option<String> {
     email
         .get(field)
@@ -770,9 +788,7 @@ impl JmapMcpService {
                 .ok_or_else(|| ErrorData::invalid_params("email_id: not found", None))?;
 
             let mut raw_body = extract_text_body(&email);
-            if raw_body.len() > MAX_TEXT_BODY_BYTES {
-                raw_body.truncate(MAX_TEXT_BODY_BYTES);
-            }
+            truncate_text_body(&mut raw_body);
             let from = addrs(&email, "from");
             let verdict = crate::content_sandbox::evaluate(
                 None,
@@ -1107,5 +1123,33 @@ mod tests {
             "bodyValues": { "1": { "value": "hello world" } }
         });
         assert_eq!(extract_text_body(&e), "hello world");
+    }
+
+    #[test]
+    fn truncate_text_body_backs_off_to_char_boundary() {
+        // The exploit shape: cap-1 ASCII bytes + a 2-byte char puts the cut
+        // index inside that char. Naive String::truncate would panic (abort).
+        let mut body = "a".repeat(MAX_TEXT_BODY_BYTES - 1);
+        body.push('é');
+        assert!(body.len() > MAX_TEXT_BODY_BYTES);
+        truncate_text_body(&mut body);
+        // Backed off below the split char; result is valid UTF-8 (no panic).
+        assert_eq!(body.len(), MAX_TEXT_BODY_BYTES - 1);
+        assert!(body.bytes().all(|b| b == b'a'));
+    }
+
+    #[test]
+    fn truncate_text_body_leaves_within_limit_untouched() {
+        let mut body = "ä".repeat(10); // 20 bytes, well under cap
+        let before = body.clone();
+        truncate_text_body(&mut body);
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn truncate_text_body_at_exact_limit_is_noop() {
+        let mut body = "a".repeat(MAX_TEXT_BODY_BYTES);
+        truncate_text_body(&mut body);
+        assert_eq!(body.len(), MAX_TEXT_BODY_BYTES);
     }
 }
