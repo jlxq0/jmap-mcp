@@ -107,6 +107,17 @@ fn parse_pairs(q: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Strip a trailing slash from an RFC 8707 `resource` indicator. claude.ai
+/// sends `https://host/`, but Logto matches the registered API resource
+/// (`https://host`) byte-for-byte and rejects the slashed form with
+/// `invalid_target`. Our resource indicators are always slash-free.
+fn normalize_resource(v: &mut String) {
+    let trimmed = v.trim_end_matches('/');
+    if trimmed.len() != v.len() {
+        *v = trimmed.to_owned();
+    }
+}
+
 /// `GET /authorize` — redirect to Logto, swapping in our callback + opaque
 /// state while preserving PKCE/nonce/scope/resource.
 pub async fn authorize(State(st): State<OAuthProxyState>, RawQuery(q): RawQuery) -> Response {
@@ -141,6 +152,8 @@ pub async fn authorize(State(st): State<OAuthProxyState>, RawQuery(q): RawQuery)
         } else if k == "state" {
             v.clone_from(&proxy_state);
             saw_state = true;
+        } else if k == "resource" {
+            normalize_resource(v);
         }
     }
     if !saw_state {
@@ -193,6 +206,8 @@ pub async fn token(State(st): State<OAuthProxyState>, body: String) -> Response 
     for (k, v) in &mut pairs {
         if k == "redirect_uri" {
             v.clone_from(&st.inner.callback_url);
+        } else if k == "resource" {
+            normalize_resource(v);
         }
     }
     let form = url::form_urlencoded::Serializer::new(String::new())
@@ -265,6 +280,17 @@ mod tests {
         assert_eq!(p.client_state.as_deref(), Some("xyz"));
         // consumed
         assert!(st.take("abc").is_none());
+    }
+
+    #[test]
+    fn normalize_resource_strips_trailing_slash() {
+        let mut a = "https://jmap-mcp.kampong.social/".to_owned();
+        normalize_resource(&mut a);
+        assert_eq!(a, "https://jmap-mcp.kampong.social");
+        // already-canonical is untouched
+        let mut b = "https://jmap-mcp.kampong.social".to_owned();
+        normalize_resource(&mut b);
+        assert_eq!(b, "https://jmap-mcp.kampong.social");
     }
 
     #[test]
