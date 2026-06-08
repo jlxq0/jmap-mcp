@@ -90,15 +90,19 @@ pub struct AuthorizationServerMetadata {
 impl AuthorizationServerMetadata {
     pub fn from_config(cfg: &Config) -> Self {
         // `authorization_server` is the Logto OIDC base, e.g.
-        // `https://login.kampong.social/oidc`. Its endpoints are `{base}/auth`,
-        // `{base}/token`, `{base}/jwks`, `{base}/me`.
+        // `https://login.kampong.social/oidc`.
         let logto = &cfg.authorization_server;
+        let us = &cfg.resource_url;
         Self {
             // The issuer is *us* — this document is fetched from our origin and
             // RFC 8414 requires issuer to equal that origin.
-            issuer: cfg.resource_url.clone(),
-            authorization_endpoint: format!("{logto}/auth"),
-            token_endpoint: format!("{logto}/token"),
+            issuer: us.clone(),
+            // authorize/token MUST be same-origin as the issuer or claude.ai's
+            // connector refuses to redirect (mix-up defense). We proxy both to
+            // Logto (see oauth_proxy). jwks stays on Logto — it's just keys and
+            // not subject to the same-origin rule.
+            authorization_endpoint: format!("{us}/authorize"),
+            token_endpoint: format!("{us}/token"),
             jwks_uri: format!("{logto}/jwks"),
             userinfo_endpoint: format!("{logto}/me"),
             registration_endpoint: cfg
@@ -207,14 +211,15 @@ mod tests {
     }
 
     #[test]
-    fn as_metadata_delegates_to_logto() {
+    fn as_metadata_is_same_origin_with_jwks_on_logto() {
         let m = AuthorizationServerMetadata::from_config(&test_config());
         assert_eq!(m.issuer, "https://jmap-mcp.example.test");
+        // authorize/token are on OUR origin (proxied); jwks stays on Logto.
         assert_eq!(
             m.authorization_endpoint,
-            "https://login.example.test/oidc/auth"
+            "https://jmap-mcp.example.test/authorize"
         );
-        assert_eq!(m.token_endpoint, "https://login.example.test/oidc/token");
+        assert_eq!(m.token_endpoint, "https://jmap-mcp.example.test/token");
         assert_eq!(m.jwks_uri, "https://login.example.test/oidc/jwks");
         assert!(m.code_challenge_methods_supported.contains(&"S256"));
         // No DCR client configured in the bare test config.

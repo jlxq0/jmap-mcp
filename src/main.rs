@@ -16,6 +16,7 @@ mod logto_oidc;
 mod mcp;
 mod metrics;
 mod oauth_metadata;
+mod oauth_proxy;
 mod rate_limit;
 mod session;
 mod telemetry;
@@ -161,6 +162,18 @@ fn build_router(
             get(authorization_server_metadata),
         )
         .route("/register", post(register))
+        // Transparent OAuth proxy: authorize/token must be same-origin as the
+        // issuer for claude.ai to redirect. These broker to Logto. Public.
+        .merge(
+            Router::new()
+                .route("/authorize", get(oauth_proxy::authorize))
+                .route("/oauth/callback", get(oauth_proxy::callback))
+                .route("/token", post(oauth_proxy::token))
+                .with_state(oauth_proxy::OAuthProxyState::new(
+                    &cfg.authorization_server,
+                    &cfg.resource_url,
+                )),
+        )
         .merge(mcp_routes)
         .layer(TraceLayer::new_for_http())
         .with_state(cfg)
