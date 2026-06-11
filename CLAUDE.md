@@ -21,6 +21,13 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   an RFC 7591 `/register` shim returning a pre-provisioned Logto public-SPA
   client (`JMAP_MCP_DCR_CLIENT_ID`). See `src/oauth_metadata.rs`.
 
+- **OAuth proxy must enforce client redirect URIs itself.** Logto only sees
+  jmap-mcp's `/oauth/callback`, not the real client callback, so `/authorize`,
+  `/token`, and `/register` must reject any `redirect_uri` outside the exact
+  `JMAP_MCP_OAUTH_REDIRECT_URIS` allowlist. Do not rely on Logto's registered
+  redirect URI policy once the transparent proxy rewrites `redirect_uri`.
+  Found 2026-06: authorization-code theft via attacker-controlled callback.
+
 ## CI / deploy
 
 - Forgejo Actions (`.forgejo/workflows/ci.yml`). The docker job derives

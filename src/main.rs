@@ -17,6 +17,7 @@ mod mcp;
 mod metrics;
 mod oauth_metadata;
 mod oauth_proxy;
+mod oauth_redirect;
 mod rate_limit;
 mod session;
 mod telemetry;
@@ -172,6 +173,7 @@ fn build_router(
                 .with_state(oauth_proxy::OAuthProxyState::new(
                     &cfg.authorization_server,
                     &cfg.resource_url,
+                    cfg.oauth_redirect_uris.clone(),
                 )),
         )
         .merge(mcp_routes)

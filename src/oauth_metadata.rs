@@ -23,6 +23,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::config::Config;
+use crate::oauth_redirect::is_allowed_redirect_uri;
 
 /// Scopes claude.ai should request. `offline_access` lets Logto mint a refresh
 /// token so the connector survives access-token expiry without a re-login.
@@ -128,9 +129,10 @@ pub async fn authorization_server_metadata(State(cfg): State<Config>) -> impl In
 // Dynamic Client Registration shim (RFC 7591)
 // ---------------------------------------------------------------------------
 
-/// Returns the single pre-provisioned Logto public client for any registration
-/// request. The Logto app already whitelists claude.ai's redirect URIs; we
-/// echo back the caller's requested `redirect_uris` for protocol conformance.
+/// Returns the single pre-provisioned Logto public client for allowed
+/// registrations. Because the proxy hides the real client redirect URI from
+/// Logto, we enforce the same exact redirect URI allowlist before echoing
+/// requested redirect URIs for protocol conformance.
 #[allow(clippy::unused_async)] // Axum requires async handlers.
 pub async fn register(State(cfg): State<Config>, body: Option<Json<Value>>) -> impl IntoResponse {
     let Some(client_id) = cfg.dcr_client_id else {
@@ -151,6 +153,13 @@ pub async fn register(State(cfg): State<Config>, body: Option<Json<Value>>) -> i
                 .collect()
         })
         .unwrap_or_default();
+
+    if redirect_uris
+        .iter()
+        .any(|uri| !is_allowed_redirect_uri(&cfg.oauth_redirect_uris, uri))
+    {
+        return (StatusCode::BAD_REQUEST, "unregistered redirect_uri\n").into_response();
+    }
 
     let resp = json!({
         "client_id": client_id,
@@ -235,6 +244,34 @@ mod tests {
             m.registration_endpoint.as_deref(),
             Some("https://jmap-mcp.example.test/register")
         );
+    }
+
+    #[tokio::test]
+    async fn register_rejects_unregistered_redirect_uri() {
+        let mut cfg = test_config();
+        cfg.dcr_client_id = Some("abc123".to_owned());
+        cfg.oauth_redirect_uris = vec!["https://claude.ai/api/mcp/auth_callback".to_owned()];
+        let body = json!({
+            "redirect_uris": ["https://attacker.example/cb"],
+        });
+
+        let response = register(State(cfg), Some(Json(body))).await.into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn register_accepts_allowlisted_redirect_uri() {
+        let mut cfg = test_config();
+        cfg.dcr_client_id = Some("abc123".to_owned());
+        cfg.oauth_redirect_uris = vec!["https://claude.ai/api/mcp/auth_callback".to_owned()];
+        let body = json!({
+            "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"],
+        });
+
+        let response = register(State(cfg), Some(Json(body))).await.into_response();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
     }
 
     #[test]

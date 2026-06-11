@@ -6,8 +6,10 @@
 //! metadata document that points `authorization_endpoint` at Logto is rejected
 //! and the connector never redirects the user to log in.
 //!
-//! So we proxy on our own origin and broker to Logto:
-//! - `GET /authorize` — store the client's `redirect_uri`/`state`, then redirect
+//! So we proxy on our own origin and broker to Logto. Because Logto sees only
+//! our callback URL, we must enforce the client redirect URI allowlist before
+//! forwarding the flow:
+//! - `GET /authorize` — validate and store the client's `redirect_uri`/`state`, then redirect
 //!   to Logto's `/auth` with **our** callback + an opaque state, preserving
 //!   everything else (PKCE `code_challenge`, `nonce`, `scope`, `resource`).
 //! - `GET /oauth/callback` — Logto returns here; map the opaque state back and
@@ -15,7 +17,7 @@
 //!   state. `iss` is intentionally not forwarded (it would be Logto's, not
 //!   ours).
 //! - `POST /token` — relay the form to Logto's `/token`, rewriting
-//!   `redirect_uri` to our callback (Logto bound the code to it). PKCE verifier
+//!   allowlisted `redirect_uri` to our callback (Logto bound the code to it). PKCE verifier
 //!   and the returned tokens pass through untouched — we mint nothing.
 
 use std::collections::HashMap;
@@ -29,6 +31,8 @@ use axum::response::{IntoResponse, Redirect, Response};
 use rand::RngCore;
 use tracing::warn;
 use url::Url;
+
+use crate::oauth_redirect::is_allowed_redirect_uri;
 
 /// How long a pending authorization (client redirect/state mapping) lives.
 #[allow(clippy::duration_suboptimal_units)] // `from_secs` is clearer than mins here
@@ -47,6 +51,7 @@ struct Inner {
     /// Our own callback, `{resource_url}/oauth/callback`.
     callback_url: String,
     http: reqwest::Client,
+    allowed_redirect_uris: Vec<String>,
     pending: Mutex<HashMap<String, Pending>>,
 }
 
@@ -57,7 +62,7 @@ struct Pending {
 }
 
 impl OAuthProxyState {
-    pub fn new(logto_base: &str, resource_url: &str) -> Self {
+    pub fn new(logto_base: &str, resource_url: &str, allowed_redirect_uris: Vec<String>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .user_agent(concat!("jmap-mcp/", env!("CARGO_PKG_VERSION")))
@@ -68,6 +73,7 @@ impl OAuthProxyState {
                 logto_base: logto_base.trim_end_matches('/').to_owned(),
                 callback_url: format!("{}/oauth/callback", resource_url.trim_end_matches('/')),
                 http,
+                allowed_redirect_uris,
                 pending: Mutex::new(HashMap::new()),
             }),
         }
@@ -130,6 +136,10 @@ pub async fn authorize(State(st): State<OAuthProxyState>, RawQuery(q): RawQuery)
     else {
         return (StatusCode::BAD_REQUEST, "missing redirect_uri\n").into_response();
     };
+    if !is_allowed_redirect_uri(&st.inner.allowed_redirect_uris, &client_redirect_uri) {
+        return (StatusCode::BAD_REQUEST, "unregistered redirect_uri\n").into_response();
+    }
+
     let client_state = pairs
         .iter()
         .find(|(k, _)| k == "state")
@@ -203,12 +213,23 @@ pub async fn callback(State(st): State<OAuthProxyState>, RawQuery(q): RawQuery) 
 /// `redirect_uri` to our callback so it matches what Logto saw at `/authorize`.
 pub async fn token(State(st): State<OAuthProxyState>, body: String) -> Response {
     let mut pairs = parse_pairs(&body);
+    let is_authorization_code = pairs
+        .iter()
+        .any(|(k, v)| k == "grant_type" && v == "authorization_code");
+    let mut saw_redirect_uri = false;
     for (k, v) in &mut pairs {
         if k == "redirect_uri" {
+            if !is_allowed_redirect_uri(&st.inner.allowed_redirect_uris, v) {
+                return (StatusCode::BAD_REQUEST, "unregistered redirect_uri\n").into_response();
+            }
+            saw_redirect_uri = true;
             v.clone_from(&st.inner.callback_url);
         } else if k == "resource" {
             normalize_resource(v);
         }
+    }
+    if is_authorization_code && !saw_redirect_uri {
+        return (StatusCode::BAD_REQUEST, "missing redirect_uri\n").into_response();
     }
     let form = url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(pairs)
@@ -256,6 +277,7 @@ mod tests {
         let st = OAuthProxyState::new(
             "https://login.example.test/oidc/",
             "https://jmap-mcp.example.test",
+            vec!["https://claude.ai/cb".to_owned()],
         );
         assert_eq!(
             st.inner.callback_url,
@@ -266,7 +288,11 @@ mod tests {
 
     #[test]
     fn pending_roundtrip_and_expiry_guard() {
-        let st = OAuthProxyState::new("https://l.test/oidc", "https://r.test");
+        let st = OAuthProxyState::new(
+            "https://l.test/oidc",
+            "https://r.test",
+            vec!["https://claude.ai/cb".to_owned()],
+        );
         st.insert(
             "abc".to_owned(),
             Pending {
@@ -280,6 +306,104 @@ mod tests {
         assert_eq!(p.client_state.as_deref(), Some("xyz"));
         // consumed
         assert!(st.take("abc").is_none());
+    }
+
+    #[tokio::test]
+    async fn authorize_rejects_unregistered_redirect_uri() {
+        let st = OAuthProxyState::new(
+            "https://login.example.test/oidc",
+            "https://jmap-mcp.example.test",
+            vec!["https://claude.ai/api/mcp/auth_callback".to_owned()],
+        );
+
+        let response = authorize(
+            State(st),
+            RawQuery(Some(
+                "client_id=abc&redirect_uri=https%3A%2F%2Fattacker.example%2Fcb&response_type=code"
+                    .to_owned(),
+            )),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn authorize_forwards_only_allowed_redirect_uri_to_pending_state() {
+        let st = OAuthProxyState::new(
+            "https://login.example.test/oidc",
+            "https://jmap-mcp.example.test",
+            vec!["https://claude.ai/api/mcp/auth_callback".to_owned()],
+        );
+
+        let response = authorize(
+            State(st.clone()),
+            RawQuery(Some(
+                "client_id=abc&redirect_uri=https%3A%2F%2Fclaude.ai%2Fapi%2Fmcp%2Fauth_callback&state=client-state&resource=https%3A%2F%2Fjmap-mcp.example.test%2F"
+                    .to_owned(),
+            )),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .expect("redirect location")
+            .to_str()
+            .unwrap();
+        let upstream = Url::parse(location).unwrap();
+        let params: HashMap<String, String> = upstream.query_pairs().into_owned().collect();
+        assert_eq!(
+            params.get("redirect_uri").map(String::as_str),
+            Some("https://jmap-mcp.example.test/oauth/callback")
+        );
+        assert_eq!(
+            params.get("resource").map(String::as_str),
+            Some("https://jmap-mcp.example.test")
+        );
+        let proxy_state = params.get("state").expect("proxy state");
+        let pending = st.take(proxy_state).expect("pending state");
+        assert_eq!(
+            pending.client_redirect_uri,
+            "https://claude.ai/api/mcp/auth_callback"
+        );
+        assert_eq!(pending.client_state.as_deref(), Some("client-state"));
+    }
+
+    #[tokio::test]
+    async fn token_rejects_unregistered_authorization_code_redirect_uri() {
+        let st = OAuthProxyState::new(
+            "https://login.example.test/oidc",
+            "https://jmap-mcp.example.test",
+            vec!["https://claude.ai/api/mcp/auth_callback".to_owned()],
+        );
+
+        let response = token(
+            State(st),
+            "grant_type=authorization_code&code=abc&redirect_uri=https%3A%2F%2Fattacker.example%2Fcb&code_verifier=v"
+                .to_owned(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn token_rejects_missing_authorization_code_redirect_uri() {
+        let st = OAuthProxyState::new(
+            "https://login.example.test/oidc",
+            "https://jmap-mcp.example.test",
+            vec!["https://claude.ai/api/mcp/auth_callback".to_owned()],
+        );
+
+        let response = token(
+            State(st),
+            "grant_type=authorization_code&code=abc&code_verifier=v".to_owned(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

@@ -64,10 +64,14 @@ docker run --rm -p 3000:3000 \
   -e JMAP_MCP_RESOURCE_URL=https://jmap-mcp.your-domain.example \
   -e JMAP_MCP_AUTHORIZATION_SERVER=https://login.your-domain.example/oidc \
   -e JMAP_MCP_STALWART_JMAP_BASE_URL=https://mail.your-domain.example \
+  -e JMAP_MCP_OAUTH_REDIRECT_URIS=https://client.example/oauth/callback \
   forge.oddie.app/jlxq0/jmap-mcp:latest
 ```
 
 Then point a public HTTPS hostname at it (claude.ai requires `https://`).
+Set `JMAP_MCP_OAUTH_REDIRECT_URIS` to the exact comma-separated redirect URI
+allowlist configured on the pre-provisioned Logto public client; the OAuth proxy
+rejects authorization and DCR requests for any other redirect URI.
 
 ## Security
 

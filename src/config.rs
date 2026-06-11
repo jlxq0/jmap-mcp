@@ -12,6 +12,8 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result};
 
+use crate::oauth_redirect;
+
 /// Public URL of this MCP server, used as the OAuth `resource` identifier
 /// (RFC 8707) and as the `resource` field in the protected-resource metadata
 /// document (RFC 9728). Also the audience jmap-mcp requires on inbound
@@ -99,6 +101,8 @@ pub struct Config {
     /// Optional static Logto `client_id` returned by the DCR shim (`/register`).
     /// `None` disables dynamic client registration advertisement.
     pub dcr_client_id: Option<String>,
+    /// Exact OAuth redirect URIs accepted by the proxy and DCR shim.
+    pub oauth_redirect_uris: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -146,6 +150,7 @@ impl Config {
             trusted_proxy_hops: DEFAULT_TRUSTED_PROXY_HOPS,
             stalwart_connect_ip: None,
             dcr_client_id: None,
+            oauth_redirect_uris: Vec::new(),
         })
     }
 
@@ -195,6 +200,7 @@ impl Config {
         cfg.dcr_client_id = std::env::var(ENV_DCR_CLIENT_ID)
             .ok()
             .filter(|s| !s.trim().is_empty());
+        cfg.oauth_redirect_uris = parse_redirect_uris_env()?;
 
         // Optional opaque-token introspection fallback credentials.
         if let (Ok(client_id), Ok(client_secret)) = (
@@ -260,6 +266,16 @@ fn parse_u64_env(key: &str, default: u64) -> Result<u64> {
                 .with_context(|| format!("{key} must be a non-negative integer, got: {raw}"))
         },
     )
+}
+
+fn parse_redirect_uris_env() -> Result<Vec<String>> {
+    match std::env::var(oauth_redirect::ENV_OAUTH_REDIRECT_URIS) {
+        Ok(raw) => oauth_redirect::parse_allowlist(&raw, oauth_redirect::ENV_OAUTH_REDIRECT_URIS),
+        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(e) => {
+            Err(e).with_context(|| format!("invalid {}", oauth_redirect::ENV_OAUTH_REDIRECT_URIS))
+        }
+    }
 }
 
 fn parse_trusted_proxy_hops() -> Result<usize> {
