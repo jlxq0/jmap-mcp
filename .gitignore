@@ -28,6 +28,9 @@ coverage/
 # Container build leftovers
 .docker-cache/
 
+# Playwright MCP session artifacts
+.playwright-mcp/
+
 # Internal planning notes — not part of the public docs surface.
 Plan.md
 docs/plan.md
