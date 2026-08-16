@@ -52,7 +52,8 @@ struct Inner {
     callback_url: String,
     http: reqwest::Client,
     allowed_redirect_uris: Vec<String>,
-    /// Forced RFC 8707 `resource` sent to Logto (Stalwart's JWT audience).
+    /// Forced RFC 8707 `resource` sent to Logto. Must be an absolute URI
+    /// (Logto API resource indicator). Never the bare string `stalwart`.
     jmap_audience: String,
     pending: Mutex<HashMap<String, Pending>>,
 }
@@ -121,18 +122,21 @@ fn parse_pairs(q: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Force the RFC 8707 `resource` we send to Logto to Stalwart's JWT
-/// audience (`stalwart` by default).
+/// Force the RFC 8707 `resource` we send to Logto to an absolute URI.
 ///
-/// Clients send `{origin}` or `{origin}/mcp` (RFC 9728). Logto then
-/// mints `aud` equal to that indicator. Stalwart's OIDC directory
-/// `requireAudience` is the Logto API resource **Stalwart Mail**
-/// (`stalwart`), so an origin-aud token is rejected as `InvalidAudience`
-/// and every tool call becomes MCP -32028. Rewrite here so the access
-/// token Stalwart sees is the one it will accept. RFC 9728 metadata
-/// and `/oauth/callback` stay on the origin; only the Logto `resource`
-/// parameter changes.
+/// Clients send `{origin}` or `{origin}/mcp` (RFC 9728 advertised
+/// resource). Logto requires an absolute URI (RFC 8707) and rejects
+/// the bare API name `stalwart` with `invalid_target`. The live Logto
+/// API resource for this proxy is `https://jmap-mcp.kampong.social`
+/// (the origin). RFC 9728 metadata stays `{origin}/mcp`; only the
+/// Logto `resource` parameter is rewritten.
+///
+/// A non-URI `jmap_audience` (including `stalwart`) is refused: we
+/// never emit it.
 fn apply_jmap_resource(pairs: &mut Vec<(String, String)>, jmap_audience: &str) {
+    if !crate::config::is_absolute_http_uri(jmap_audience) {
+        return;
+    }
     let mut saw = false;
     for (k, v) in pairs.iter_mut() {
         if k == "resource" {
@@ -297,7 +301,7 @@ mod tests {
             "https://login.example.test/oidc/",
             "https://jmap-mcp.example.test",
             vec!["https://claude.ai/cb".to_owned()],
-            "stalwart",
+            "https://jmap-mcp.example.test",
         );
         assert_eq!(
             st.inner.callback_url,
@@ -312,7 +316,7 @@ mod tests {
             "https://l.test/oidc",
             "https://r.test",
             vec!["https://claude.ai/cb".to_owned()],
-            "stalwart",
+            "https://r.test",
         );
         st.insert(
             "abc".to_owned(),
@@ -335,7 +339,7 @@ mod tests {
             "https://login.example.test/oidc",
             "https://jmap-mcp.example.test",
             vec!["https://claude.ai/api/mcp/auth_callback".to_owned()],
-            "stalwart",
+            "https://jmap-mcp.example.test",
         );
 
         let response = authorize(
@@ -356,7 +360,7 @@ mod tests {
             "https://login.example.test/oidc",
             "https://jmap-mcp.example.test",
             vec!["https://claude.ai/api/mcp/auth_callback".to_owned()],
-            "stalwart",
+            "https://jmap-mcp.example.test",
         );
 
         let response = authorize(
@@ -381,7 +385,11 @@ mod tests {
             params.get("redirect_uri").map(String::as_str),
             Some("https://jmap-mcp.example.test/oauth/callback")
         );
-        assert_eq!(params.get("resource").map(String::as_str), Some("stalwart"));
+        let resource = params.get("resource").map(String::as_str);
+        assert_eq!(resource, Some("https://jmap-mcp.example.test"));
+        let parsed = Url::parse(resource.unwrap()).unwrap();
+        assert!(parsed.scheme() == "https" && parsed.host_str().is_some());
+        assert_ne!(resource, Some("stalwart"));
         let proxy_state = params.get("state").expect("proxy state");
         let pending = st.take(proxy_state).expect("pending state");
         assert_eq!(
@@ -397,7 +405,7 @@ mod tests {
             "https://login.example.test/oidc",
             "https://jmap-mcp.example.test",
             vec!["https://claude.ai/api/mcp/auth_callback".to_owned()],
-            "stalwart",
+            "https://jmap-mcp.example.test",
         );
 
         let response = token(
@@ -416,7 +424,7 @@ mod tests {
             "https://login.example.test/oidc",
             "https://jmap-mcp.example.test",
             vec!["https://claude.ai/api/mcp/auth_callback".to_owned()],
-            "stalwart",
+            "https://jmap-mcp.example.test",
         );
 
         let response = token(
@@ -429,32 +437,53 @@ mod tests {
     }
 
     #[test]
-    fn apply_jmap_resource_rewrites_origin_and_mcp_path() {
+    fn apply_jmap_resource_rewrites_origin_and_mcp_path_to_absolute_uri() {
+        const URI: &str = "https://jmap-mcp.kampong.social";
+        let mut pairs = vec![(
+            "resource".to_owned(),
+            "https://jmap-mcp.kampong.social/mcp".to_owned(),
+        )];
+        apply_jmap_resource(&mut pairs, URI);
+        assert_eq!(pairs, vec![("resource".to_owned(), URI.to_owned())]);
+        assert!(Url::parse(&pairs[0].1).unwrap().has_host());
+        let mut pairs = vec![(
+            "resource".to_owned(),
+            "https://jmap-mcp.kampong.social/".to_owned(),
+        )];
+        apply_jmap_resource(&mut pairs, URI);
+        assert_eq!(pairs, vec![("resource".to_owned(), URI.to_owned())]);
+    }
+
+    #[test]
+    fn apply_jmap_resource_inserts_absolute_uri_when_missing() {
+        const URI: &str = "https://jmap-mcp.kampong.social";
+        let mut pairs = vec![("scope".to_owned(), "openid".to_owned())];
+        apply_jmap_resource(&mut pairs, URI);
+        assert_eq!(
+            pairs,
+            vec![
+                ("scope".to_owned(), "openid".to_owned()),
+                ("resource".to_owned(), URI.to_owned()),
+            ]
+        );
+        assert_ne!(pairs[1].1.as_str(), "stalwart");
+        assert!(Url::parse(&pairs[1].1).is_ok());
+    }
+
+    #[test]
+    fn apply_jmap_resource_never_sends_bare_stalwart() {
         let mut pairs = vec![(
             "resource".to_owned(),
             "https://jmap-mcp.kampong.social/mcp".to_owned(),
         )];
         apply_jmap_resource(&mut pairs, "stalwart");
-        assert_eq!(pairs, vec![("resource".to_owned(), "stalwart".to_owned())]);
-        let mut pairs = vec![(
-            "resource".to_owned(),
-            "https://jmap-mcp.kampong.social/".to_owned(),
-        )];
-        apply_jmap_resource(&mut pairs, "stalwart");
-        assert_eq!(pairs, vec![("resource".to_owned(), "stalwart".to_owned())]);
-    }
-
-    #[test]
-    fn apply_jmap_resource_inserts_when_missing() {
-        let mut pairs = vec![("scope".to_owned(), "openid".to_owned())];
-        apply_jmap_resource(&mut pairs, "stalwart");
-        assert_eq!(
-            pairs,
-            vec![
-                ("scope".to_owned(), "openid".to_owned()),
-                ("resource".to_owned(), "stalwart".to_owned()),
-            ]
-        );
+        let resource = pairs
+            .iter()
+            .find(|(k, _)| k == "resource")
+            .map(|(_, v)| v.as_str());
+        assert_ne!(resource, Some("stalwart"));
+        // refused: original client value is left untouched
+        assert_eq!(resource, Some("https://jmap-mcp.kampong.social/mcp"));
     }
 
     #[test]

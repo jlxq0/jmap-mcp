@@ -70,8 +70,9 @@ const DEFAULT_RATE_LIMIT_WRITES: u32 = 30;
 const DEFAULT_DOWNLOAD_MAX_BYTES: u64 = 5 * 1024 * 1024;
 pub const DEFAULT_UPLOAD_MAX_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_TRUSTED_PROXY_HOPS: usize = 1;
-/// Default Logto API resource indicator / Stalwart `requireAudience`.
-pub const DEFAULT_STALWART_AUDIENCE: &str = "stalwart";
+/// Fallback Logto RFC 8707 resource / Stalwart `requireAudience` when
+/// `JMAP_MCP_STALWART_AUDIENCE` is unset: the MCP origin (`resource_url`).
+/// Must be an absolute http(s) URI — never the bare string `stalwart`.
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -108,9 +109,10 @@ pub struct Config {
     pub dcr_client_id: Option<String>,
     /// Exact OAuth redirect URIs accepted by the proxy and DCR shim.
     pub oauth_redirect_uris: Vec<String>,
-    /// JWT audience Stalwart's OIDC directory requires. The OAuth proxy
-    /// forces this as the RFC 8707 `resource` sent to Logto so the access
-    /// token's `aud` is accepted by JMAP. Default `stalwart`.
+    /// Absolute-URI JWT audience Stalwart's OIDC directory requires.
+    /// The OAuth proxy sends this as the RFC 8707 `resource` to Logto
+    /// (Logto rejects non-URI indicators with `invalid_target`). Default
+    /// is `resource_url` (the origin). Never `stalwart`.
     pub stalwart_audience: String,
 }
 
@@ -146,7 +148,7 @@ impl Config {
         validate_url(&authorization_server, ENV_AUTH_SERVER_URL)?;
         validate_url(&stalwart_jmap_base_url, ENV_STALWART_JMAP_BASE_URL)?;
         Ok(Self {
-            resource_url,
+            resource_url: resource_url.clone(),
             authorization_server,
             stalwart_jmap_base_url,
             bind_addr,
@@ -160,7 +162,7 @@ impl Config {
             stalwart_connect_ip: None,
             dcr_client_id: None,
             oauth_redirect_uris: Vec::new(),
-            stalwart_audience: DEFAULT_STALWART_AUDIENCE.to_owned(),
+            stalwart_audience: resource_url,
         })
     }
 
@@ -172,9 +174,9 @@ impl Config {
     }
 
     /// Audiences we accept on inbound Logto access tokens: the origin
-    /// (historical / `JMAP_MCP_RESOURCE_URL`), `{origin}/mcp` (RFC 9728
-    /// resource some clients put in `aud`), and the Stalwart API resource
-    /// (`stalwart_audience`) that JMAP actually requires.
+    /// (`JMAP_MCP_RESOURCE_URL`), `{origin}/mcp` (RFC 9728 resource some
+    /// clients put in `aud`), and `stalwart_audience` (the absolute URI
+    /// sent to Logto / required by Stalwart).
     pub fn accepted_token_audiences(&self) -> Vec<String> {
         let mut v = vec![
             self.resource_url.clone(),
@@ -226,11 +228,24 @@ impl Config {
             .ok()
             .filter(|s| !s.trim().is_empty());
         cfg.oauth_redirect_uris = parse_redirect_uris_env()?;
-        cfg.stalwart_audience = std::env::var(ENV_STALWART_AUDIENCE)
+        cfg.stalwart_audience = match std::env::var(ENV_STALWART_AUDIENCE)
             .ok()
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| DEFAULT_STALWART_AUDIENCE.to_owned());
+        {
+            Some(raw) => {
+                // RFC 8707: Logto rejects a non-URI resource with invalid_target.
+                // The previous default `stalwart` is the Logto API *name*, not
+                // an indicator — never send it.
+                if raw == "stalwart" || !is_absolute_http_uri(&raw) {
+                    anyhow::bail!(
+                        "{ENV_STALWART_AUDIENCE} must be an absolute http(s) URI (RFC 8707 resource indicator); got {raw:?}. Do not use the bare string \"stalwart\"."
+                    );
+                }
+                strip_trailing_slash(raw)
+            }
+            None => cfg.resource_url.clone(),
+        };
 
         // Optional opaque-token introspection fallback credentials.
         if let (Ok(client_id), Ok(client_secret)) = (
@@ -265,10 +280,18 @@ fn require_env(key: &str) -> Result<String> {
 }
 
 fn validate_url(url: &str, key: &str) -> Result<()> {
-    if !url.starts_with("https://") && !url.starts_with("http://") {
+    if !is_absolute_http_uri(url) {
         anyhow::bail!("{key} must be an absolute http(s) URL, got: {url}");
     }
     Ok(())
+}
+
+/// RFC 8707 resource indicator: absolute http(s) URI. Rejects bare tokens
+/// such as `stalwart` that Logto answers with `invalid_target`.
+pub fn is_absolute_http_uri(url: &str) -> bool {
+    (url.starts_with("https://") || url.starts_with("http://"))
+        && url.len() > "https://".len()
+        && !url.chars().any(char::is_whitespace)
 }
 
 fn parse_rate_limit(key: &str, default: u32) -> Result<u32> {
@@ -358,11 +381,21 @@ mod tests {
     }
 
     #[test]
-    fn accepted_audiences_include_origin_mcp_and_stalwart() {
+    fn accepted_audiences_include_origin_and_mcp_path() {
         let a = cfg().accepted_token_audiences();
         assert!(a.contains(&"https://jmap-mcp.example.test".to_owned()));
         assert!(a.contains(&"https://jmap-mcp.example.test/mcp".to_owned()));
-        assert!(a.contains(&"stalwart".to_owned()));
+        assert!(!a.iter().any(|x| x == "stalwart"));
+        assert_eq!(cfg().stalwart_audience, "https://jmap-mcp.example.test");
+    }
+
+    #[test]
+    fn rejects_bare_stalwart_as_rfc8707_resource() {
+        assert!(!is_absolute_http_uri("stalwart"));
+        assert!(!is_absolute_http_uri(""));
+        assert!(!is_absolute_http_uri("jmap-mcp.kampong.social"));
+        assert!(is_absolute_http_uri("https://jmap-mcp.kampong.social"));
+        assert!(is_absolute_http_uri("https://jmap.kampong.social"));
     }
 
     #[test]
