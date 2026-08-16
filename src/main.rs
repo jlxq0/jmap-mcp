@@ -155,6 +155,21 @@ fn build_router(
             "/.well-known/oauth-protected-resource",
             get(protected_resource_metadata),
         )
+        // RFC 9728 §3.1 path-aware variant. Clients that canonicalise this
+        // server as `<origin>/mcp` probe `/.well-known/oauth-protected-resource/mcp`
+        // FIRST; without this route they hit the catch-all 401 and can never
+        // show a connect card. Serves the same document.
+        //
+        // NOTE: the `resource` value inside that document is deliberately left
+        // as the bare origin, NOT `<origin>/mcp`. `cfg.resource_url` is also
+        // the expected token audience (see `LogtoValidationClient::new`) and
+        // the base for `/oauth/callback`, so changing it would invalidate every
+        // already-issued token and force all connectors to re-auth. Correcting
+        // that is a separate, breaking change.
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(protected_resource_metadata),
+        )
         // Authorization-server metadata (RFC 8414) + DCR shim (RFC 7591) that
         // front Logto so claude.ai's connector can self-register. Public — the
         // OAuth dance happens before any bearer exists.
