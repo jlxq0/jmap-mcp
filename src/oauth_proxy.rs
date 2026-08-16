@@ -113,14 +113,20 @@ fn parse_pairs(q: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Strip a trailing slash from an RFC 8707 `resource` indicator. claude.ai
-/// sends `https://host/`, but Logto matches the registered API resource
-/// (`https://host`) byte-for-byte and rejects the slashed form with
-/// `invalid_target`. Our resource indicators are always slash-free.
+/// Normalize an RFC 8707 `resource` indicator before proxying to Logto.
+///
+/// claude.ai sends `https://host/`; Logto matches the registered API
+/// resource (`https://host`) byte-for-byte and rejects the slashed form
+/// with `invalid_target`. After we advertise `resource = {origin}/mcp`,
+/// clients send that path too. Logto's registered API resource (and the
+/// JWT `aud` we validate) remains the origin, so strip a trailing `/mcp`.
 fn normalize_resource(v: &mut String) {
-    let trimmed = v.trim_end_matches('/');
-    if trimmed.len() != v.len() {
-        *v = trimmed.to_owned();
+    let mut s = v.trim_end_matches('/').to_owned();
+    if let Some(stripped) = s.strip_suffix("/mcp") {
+        s = stripped.to_owned();
+    }
+    if s != *v {
+        *v = s;
     }
 }
 
@@ -413,6 +419,16 @@ mod tests {
         assert_eq!(a, "https://jmap-mcp.kampong.social");
         // already-canonical is untouched
         let mut b = "https://jmap-mcp.kampong.social".to_owned();
+        normalize_resource(&mut b);
+        assert_eq!(b, "https://jmap-mcp.kampong.social");
+    }
+
+    #[test]
+    fn normalize_resource_strips_mcp_path() {
+        let mut a = "https://jmap-mcp.kampong.social/mcp".to_owned();
+        normalize_resource(&mut a);
+        assert_eq!(a, "https://jmap-mcp.kampong.social");
+        let mut b = "https://jmap-mcp.kampong.social/mcp/".to_owned();
         normalize_resource(&mut b);
         assert_eq!(b, "https://jmap-mcp.kampong.social");
     }

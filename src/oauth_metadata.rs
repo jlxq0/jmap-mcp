@@ -48,10 +48,24 @@ pub struct ProtectedResourceMetadata {
     pub scopes_supported: Vec<String>,
 }
 
+/// Canonical MCP resource identifier: `{origin}/mcp`.
+///
+/// RFC 9728 §3.3 and the MCP authorization spec require `resource` to match
+/// the URL the client actually connects to. claude.ai tolerates the bare
+/// origin; stricter clients (Grok Bot, LangDock) reject a token whose
+/// advertised resource is the origin when they connected to `{origin}/mcp`.
+///
+/// `cfg.resource_url` stays the origin: it is the JWT audience Logto issues,
+/// the RFC 8414 issuer, and the `/oauth/callback` base. Do not change
+/// `JMAP_MCP_RESOURCE_URL` to include `/mcp`.
+pub fn mcp_resource(resource_url: &str) -> String {
+    format!("{}/mcp", resource_url.trim_end_matches('/'))
+}
+
 impl ProtectedResourceMetadata {
     pub fn from_config(cfg: &Config) -> Self {
         Self {
-            resource: cfg.resource_url.clone(),
+            resource: mcp_resource(&cfg.resource_url),
             // Point at OURSELVES, not Logto: claude.ai then fetches our
             // /.well-known/oauth-authorization-server (which carries a
             // registration_endpoint). The authorize/token endpoints in that
@@ -185,7 +199,7 @@ fn now_unix() -> i64 {
 /// Build the `WWW-Authenticate` value our 401 responses set. claude.ai parses
 /// `resource_metadata` and walks back to discover the authorization server.
 pub fn www_authenticate_header(resource_url: &str) -> String {
-    format!(r#"Bearer resource_metadata="{resource_url}/.well-known/oauth-protected-resource""#)
+    format!(r#"Bearer resource_metadata="{resource_url}/.well-known/oauth-protected-resource/mcp""#)
 }
 
 #[cfg(test)]
@@ -208,7 +222,7 @@ mod tests {
     #[test]
     fn protected_resource_points_at_self() {
         let m = ProtectedResourceMetadata::from_config(&test_config());
-        assert_eq!(m.resource, "https://jmap-mcp.example.test");
+        assert_eq!(m.resource, "https://jmap-mcp.example.test/mcp");
         // We front the IdP: authorization_servers must be our own origin so
         // claude.ai fetches our DCR-enabled metadata.
         assert_eq!(
@@ -279,7 +293,7 @@ mod tests {
         let h = www_authenticate_header("https://jmap-mcp.example.test");
         assert!(h.starts_with("Bearer "));
         assert!(h.contains(
-            r#"resource_metadata="https://jmap-mcp.example.test/.well-known/oauth-protected-resource""#
+            r#"resource_metadata="https://jmap-mcp.example.test/.well-known/oauth-protected-resource/mcp""#
         ));
     }
 }
