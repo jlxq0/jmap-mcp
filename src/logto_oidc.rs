@@ -105,7 +105,7 @@ pub enum ValidationError {
 pub struct LogtoValidationClient {
     http: reqwest::Client,
     jwks_url: String,
-    expected_audience: String,
+    expected_audiences: Vec<String>,
     expected_issuer: String,
     jwks: Arc<RwLock<JwksCache>>,
     cache: Arc<RwLock<HashMap<[u8; 32], CacheEntry>>>,
@@ -116,7 +116,7 @@ impl std::fmt::Debug for LogtoValidationClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LogtoValidationClient")
             .field("jwks_url", &self.jwks_url)
-            .field("expected_audience", &self.expected_audience)
+            .field("expected_audiences", &self.expected_audiences)
             .finish()
     }
 }
@@ -137,7 +137,11 @@ impl LogtoValidationClient {
     /// Build a validation client. `authorization_server` is the Logto OIDC
     /// issuer base (`https://login.kampong.social/oidc`); the JWKS lives at
     /// `{issuer}/jwks` and the `iss` claim equals the issuer base exactly.
-    pub fn new(authorization_server: &str, expected_audience: String) -> Result<Self> {
+    pub fn new(authorization_server: &str, expected_audiences: Vec<String>) -> Result<Self> {
+        anyhow::ensure!(
+            !expected_audiences.is_empty(),
+            "at least one expected JWT audience is required"
+        );
         let issuer = authorization_server.trim_end_matches('/').to_owned();
         let jwks_url = format!("{issuer}/jwks");
         let http = reqwest::Client::builder()
@@ -148,7 +152,7 @@ impl LogtoValidationClient {
         Ok(Self {
             http,
             jwks_url,
-            expected_audience,
+            expected_audiences,
             expected_issuer: issuer,
             jwks: Arc::new(RwLock::new(JwksCache::default())),
             cache: Arc::new(RwLock::new(HashMap::new())),
@@ -204,7 +208,8 @@ impl LogtoValidationClient {
             return Ok(None);
         }
         let mut validation = Validation::new(header.alg);
-        validation.set_audience(&[&self.expected_audience]);
+        let audiences: Vec<&str> = self.expected_audiences.iter().map(String::as_str).collect();
+        validation.set_audience(&audiences);
         validation.set_issuer(&[&self.expected_issuer]);
         validation.set_required_spec_claims(&["exp", "aud", "iss", "sub"]);
 
@@ -219,8 +224,12 @@ impl LogtoValidationClient {
         // Defence in depth: jsonwebtoken already enforced aud via Validation,
         // but re-check membership explicitly to be robust against future
         // Validation default changes.
-        if !claims.aud.matches(&self.expected_audience) {
-            warn!("token audience does not include resource url; rejecting");
+        if !self
+            .expected_audiences
+            .iter()
+            .any(|expected| claims.aud.matches(expected))
+        {
+            warn!("token audience does not include a recognised resource; rejecting");
             return Ok(None);
         }
 
@@ -343,17 +352,22 @@ mod tests {
 
     #[test]
     fn jwks_url_derived_from_issuer() {
-        let c =
-            LogtoValidationClient::new("https://login.example.test/oidc/", "https://res".into())
-                .unwrap();
+        let c = LogtoValidationClient::new(
+            "https://login.example.test/oidc/",
+            vec!["https://res".into()],
+        )
+        .unwrap();
         assert_eq!(c.jwks_url, "https://login.example.test/oidc/jwks");
         assert_eq!(c.expected_issuer, "https://login.example.test/oidc");
     }
 
     #[tokio::test]
     async fn opaque_token_rejected() {
-        let c = LogtoValidationClient::new("https://login.example.test/oidc", "https://res".into())
-            .unwrap();
+        let c = LogtoValidationClient::new(
+            "https://login.example.test/oidc",
+            vec!["https://res".into()],
+        )
+        .unwrap();
         // Not a JWT — decode_header fails, no network touched.
         assert!(c.validate_token("opaque-abc123").await.unwrap().is_none());
     }

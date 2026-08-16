@@ -73,7 +73,8 @@ async fn main() -> Result<()> {
 }
 
 fn build_app(cfg: Config) -> Result<Router> {
-    let logto = LogtoValidationClient::new(&cfg.authorization_server, cfg.resource_url.clone())?;
+    let logto =
+        LogtoValidationClient::new(&cfg.authorization_server, cfg.accepted_token_audiences())?;
     let jmap = JmapClient::new(
         &cfg.stalwart_jmap_base_url,
         cfg.stalwart_connect_ip.as_deref(),
@@ -183,6 +184,7 @@ fn build_router(
                     &cfg.authorization_server,
                     &cfg.resource_url,
                     cfg.oauth_redirect_uris.clone(),
+                    &cfg.stalwart_audience,
                 )),
         )
         .merge(mcp_routes)
@@ -305,8 +307,9 @@ mod tests {
     }
 
     fn router(cfg: Config) -> Router {
-        let logto = LogtoValidationClient::new(&cfg.authorization_server, cfg.resource_url.clone())
-            .unwrap();
+        let logto =
+            LogtoValidationClient::new(&cfg.authorization_server, cfg.accepted_token_audiences())
+                .unwrap();
         let jmap = JmapClient::new(&cfg.stalwart_jmap_base_url, None).unwrap();
         let auth_state = AuthState {
             config: cfg.clone(),

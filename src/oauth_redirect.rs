@@ -130,7 +130,10 @@ mod tests {
             &allowed,
             "cursor://anysphere.cursor-mcp/oauth/callback/extra"
         ));
-        assert!(!is_allowed_redirect_uri(&allowed, "evil://mcp/oauth/callback"));
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "evil://mcp/oauth/callback"
+        ));
     }
 
     /// RFC 8252 §7.3 — loopback HTTP is allowed; any other cleartext host is

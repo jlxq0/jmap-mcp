@@ -61,12 +61,17 @@ const ENV_TRUSTED_PROXY_HOPS: &str = "JMAP_MCP_TRUSTED_PROXY_HOPS";
 /// `Host` = the public hostname (so TLS + JMAP session URLs stay valid) but
 /// dial the in-cluster Service `ClusterIP` on port 443.
 const ENV_STALWART_CONNECT_IP: &str = "JMAP_MCP_STALWART_CONNECT_IP";
+/// JWT `aud` Stalwart's OIDC directory requires (`requireAudience`).
+/// Must match the Logto API resource indicator for Stalwart Mail.
+const ENV_STALWART_AUDIENCE: &str = "JMAP_MCP_STALWART_AUDIENCE";
 
 const DEFAULT_RATE_LIMIT_READS: u32 = 60;
 const DEFAULT_RATE_LIMIT_WRITES: u32 = 30;
 const DEFAULT_DOWNLOAD_MAX_BYTES: u64 = 5 * 1024 * 1024;
 pub const DEFAULT_UPLOAD_MAX_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_TRUSTED_PROXY_HOPS: usize = 1;
+/// Default Logto API resource indicator / Stalwart `requireAudience`.
+pub const DEFAULT_STALWART_AUDIENCE: &str = "stalwart";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -103,6 +108,10 @@ pub struct Config {
     pub dcr_client_id: Option<String>,
     /// Exact OAuth redirect URIs accepted by the proxy and DCR shim.
     pub oauth_redirect_uris: Vec<String>,
+    /// JWT audience Stalwart's OIDC directory requires. The OAuth proxy
+    /// forces this as the RFC 8707 `resource` sent to Logto so the access
+    /// token's `aud` is accepted by JMAP. Default `stalwart`.
+    pub stalwart_audience: String,
 }
 
 #[derive(Clone)]
@@ -151,6 +160,7 @@ impl Config {
             stalwart_connect_ip: None,
             dcr_client_id: None,
             oauth_redirect_uris: Vec::new(),
+            stalwart_audience: DEFAULT_STALWART_AUDIENCE.to_owned(),
         })
     }
 
@@ -159,6 +169,21 @@ impl Config {
     pub fn with_introspection(mut self, creds: IntrospectionCredentials) -> Self {
         self.introspection = Some(creds);
         self
+    }
+
+    /// Audiences we accept on inbound Logto access tokens: the origin
+    /// (historical / `JMAP_MCP_RESOURCE_URL`), `{origin}/mcp` (RFC 9728
+    /// resource some clients put in `aud`), and the Stalwart API resource
+    /// (`stalwart_audience`) that JMAP actually requires.
+    pub fn accepted_token_audiences(&self) -> Vec<String> {
+        let mut v = vec![
+            self.resource_url.clone(),
+            crate::oauth_metadata::mcp_resource(&self.resource_url),
+            self.stalwart_audience.clone(),
+        ];
+        v.sort();
+        v.dedup();
+        v
     }
 
     /// Load from environment variables. Missing required vars are fatal at
@@ -201,6 +226,11 @@ impl Config {
             .ok()
             .filter(|s| !s.trim().is_empty());
         cfg.oauth_redirect_uris = parse_redirect_uris_env()?;
+        cfg.stalwart_audience = std::env::var(ENV_STALWART_AUDIENCE)
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_STALWART_AUDIENCE.to_owned());
 
         // Optional opaque-token introspection fallback credentials.
         if let (Ok(client_id), Ok(client_secret)) = (
@@ -325,6 +355,14 @@ mod tests {
             SocketAddr::from(([0, 0, 0, 0], 3000)),
         );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn accepted_audiences_include_origin_mcp_and_stalwart() {
+        let a = cfg().accepted_token_audiences();
+        assert!(a.contains(&"https://jmap-mcp.example.test".to_owned()));
+        assert!(a.contains(&"https://jmap-mcp.example.test/mcp".to_owned()));
+        assert!(a.contains(&"stalwart".to_owned()));
     }
 
     #[test]

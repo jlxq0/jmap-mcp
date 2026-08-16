@@ -145,11 +145,8 @@ impl JmapClient {
             .bearer_auth(token)
             .send()
             .await?;
+        let resp = self.reject_unauthorized(token, resp).await?;
         let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            self.evict(token);
-            return Err(JmapError::Unauthorized);
-        }
         if !status.is_success() {
             return Err(JmapError::Upstream {
                 status: status.as_u16(),
@@ -198,11 +195,8 @@ impl JmapClient {
             .json(&body)
             .send()
             .await?;
+        let resp = self.reject_unauthorized(token, resp).await?;
         let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            self.evict(token);
-            return Err(JmapError::Unauthorized);
-        }
         if !status.is_success() {
             return Err(JmapError::Upstream {
                 status: status.as_u16(),
@@ -270,11 +264,8 @@ impl JmapClient {
             name,
         );
         let resp = self.http.get(&url).bearer_auth(token).send().await?;
+        let resp = self.reject_unauthorized(token, resp).await?;
         let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            self.evict(token);
-            return Err(JmapError::Unauthorized);
-        }
         if !status.is_success() {
             return Err(JmapError::Upstream {
                 status: status.as_u16(),
@@ -313,11 +304,8 @@ impl JmapClient {
             .body(bytes)
             .send()
             .await?;
+        let resp = self.reject_unauthorized(token, resp).await?;
         let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            self.evict(token);
-            return Err(JmapError::Unauthorized);
-        }
         if !status.is_success() {
             return Err(JmapError::Upstream {
                 status: status.as_u16(),
@@ -326,6 +314,28 @@ impl JmapClient {
         resp.json()
             .await
             .map_err(|e| JmapError::Parse(format!("blob upload response: {e}")))
+    }
+
+    /// 401/403 from Stalwart: log a short body snippet (never the bearer)
+    /// and evict the cached session.
+    async fn reject_unauthorized(
+        &self,
+        token: &str,
+        resp: reqwest::Response,
+    ) -> Result<reqwest::Response, JmapError> {
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            let body = resp.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(160).collect();
+            warn!(
+                status = status.as_u16(),
+                body = %snippet,
+                "Stalwart rejected bearer"
+            );
+            self.evict(token);
+            return Err(JmapError::Unauthorized);
+        }
+        Ok(resp)
     }
 
     /// Drop the cached session for a token (after a 401 from Stalwart).

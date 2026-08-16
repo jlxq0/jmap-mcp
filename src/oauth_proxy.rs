@@ -52,6 +52,8 @@ struct Inner {
     callback_url: String,
     http: reqwest::Client,
     allowed_redirect_uris: Vec<String>,
+    /// Forced RFC 8707 `resource` sent to Logto (Stalwart's JWT audience).
+    jmap_audience: String,
     pending: Mutex<HashMap<String, Pending>>,
 }
 
@@ -62,7 +64,12 @@ struct Pending {
 }
 
 impl OAuthProxyState {
-    pub fn new(logto_base: &str, resource_url: &str, allowed_redirect_uris: Vec<String>) -> Self {
+    pub fn new(
+        logto_base: &str,
+        resource_url: &str,
+        allowed_redirect_uris: Vec<String>,
+        jmap_audience: impl Into<String>,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .user_agent(concat!("jmap-mcp/", env!("CARGO_PKG_VERSION")))
@@ -74,6 +81,7 @@ impl OAuthProxyState {
                 callback_url: format!("{}/oauth/callback", resource_url.trim_end_matches('/')),
                 http,
                 allowed_redirect_uris,
+                jmap_audience: jmap_audience.into(),
                 pending: Mutex::new(HashMap::new()),
             }),
         }
@@ -113,20 +121,27 @@ fn parse_pairs(q: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Normalize an RFC 8707 `resource` indicator before proxying to Logto.
+/// Force the RFC 8707 `resource` we send to Logto to Stalwart's JWT
+/// audience (`stalwart` by default).
 ///
-/// claude.ai sends `https://host/`; Logto matches the registered API
-/// resource (`https://host`) byte-for-byte and rejects the slashed form
-/// with `invalid_target`. After we advertise `resource = {origin}/mcp`,
-/// clients send that path too. Logto's registered API resource (and the
-/// JWT `aud` we validate) remains the origin, so strip a trailing `/mcp`.
-fn normalize_resource(v: &mut String) {
-    let mut s = v.trim_end_matches('/').to_owned();
-    if let Some(stripped) = s.strip_suffix("/mcp") {
-        s = stripped.to_owned();
+/// Clients send `{origin}` or `{origin}/mcp` (RFC 9728). Logto then
+/// mints `aud` equal to that indicator. Stalwart's OIDC directory
+/// `requireAudience` is the Logto API resource **Stalwart Mail**
+/// (`stalwart`), so an origin-aud token is rejected as `InvalidAudience`
+/// and every tool call becomes MCP -32028. Rewrite here so the access
+/// token Stalwart sees is the one it will accept. RFC 9728 metadata
+/// and `/oauth/callback` stay on the origin; only the Logto `resource`
+/// parameter changes.
+fn apply_jmap_resource(pairs: &mut Vec<(String, String)>, jmap_audience: &str) {
+    let mut saw = false;
+    for (k, v) in pairs.iter_mut() {
+        if k == "resource" {
+            jmap_audience.clone_into(v);
+            saw = true;
+        }
     }
-    if s != *v {
-        *v = s;
+    if !saw {
+        pairs.push(("resource".to_owned(), jmap_audience.to_owned()));
     }
 }
 
@@ -168,13 +183,12 @@ pub async fn authorize(State(st): State<OAuthProxyState>, RawQuery(q): RawQuery)
         } else if k == "state" {
             v.clone_from(&proxy_state);
             saw_state = true;
-        } else if k == "resource" {
-            normalize_resource(v);
         }
     }
     if !saw_state {
         pairs.push(("state".to_owned(), proxy_state));
     }
+    apply_jmap_resource(&mut pairs, &st.inner.jmap_audience);
 
     let qs = url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(pairs)
@@ -230,10 +244,9 @@ pub async fn token(State(st): State<OAuthProxyState>, body: String) -> Response 
             }
             saw_redirect_uri = true;
             v.clone_from(&st.inner.callback_url);
-        } else if k == "resource" {
-            normalize_resource(v);
         }
     }
+    apply_jmap_resource(&mut pairs, &st.inner.jmap_audience);
     if is_authorization_code && !saw_redirect_uri {
         return (StatusCode::BAD_REQUEST, "missing redirect_uri\n").into_response();
     }
@@ -284,6 +297,7 @@ mod tests {
             "https://login.example.test/oidc/",
             "https://jmap-mcp.example.test",
             vec!["https://claude.ai/cb".to_owned()],
+            "stalwart",
         );
         assert_eq!(
             st.inner.callback_url,
@@ -298,6 +312,7 @@ mod tests {
             "https://l.test/oidc",
             "https://r.test",
             vec!["https://claude.ai/cb".to_owned()],
+            "stalwart",
         );
         st.insert(
             "abc".to_owned(),
@@ -320,6 +335,7 @@ mod tests {
             "https://login.example.test/oidc",
             "https://jmap-mcp.example.test",
             vec!["https://claude.ai/api/mcp/auth_callback".to_owned()],
+            "stalwart",
         );
 
         let response = authorize(
@@ -340,6 +356,7 @@ mod tests {
             "https://login.example.test/oidc",
             "https://jmap-mcp.example.test",
             vec!["https://claude.ai/api/mcp/auth_callback".to_owned()],
+            "stalwart",
         );
 
         let response = authorize(
@@ -364,10 +381,7 @@ mod tests {
             params.get("redirect_uri").map(String::as_str),
             Some("https://jmap-mcp.example.test/oauth/callback")
         );
-        assert_eq!(
-            params.get("resource").map(String::as_str),
-            Some("https://jmap-mcp.example.test")
-        );
+        assert_eq!(params.get("resource").map(String::as_str), Some("stalwart"));
         let proxy_state = params.get("state").expect("proxy state");
         let pending = st.take(proxy_state).expect("pending state");
         assert_eq!(
@@ -383,6 +397,7 @@ mod tests {
             "https://login.example.test/oidc",
             "https://jmap-mcp.example.test",
             vec!["https://claude.ai/api/mcp/auth_callback".to_owned()],
+            "stalwart",
         );
 
         let response = token(
@@ -401,6 +416,7 @@ mod tests {
             "https://login.example.test/oidc",
             "https://jmap-mcp.example.test",
             vec!["https://claude.ai/api/mcp/auth_callback".to_owned()],
+            "stalwart",
         );
 
         let response = token(
@@ -413,24 +429,32 @@ mod tests {
     }
 
     #[test]
-    fn normalize_resource_strips_trailing_slash() {
-        let mut a = "https://jmap-mcp.kampong.social/".to_owned();
-        normalize_resource(&mut a);
-        assert_eq!(a, "https://jmap-mcp.kampong.social");
-        // already-canonical is untouched
-        let mut b = "https://jmap-mcp.kampong.social".to_owned();
-        normalize_resource(&mut b);
-        assert_eq!(b, "https://jmap-mcp.kampong.social");
+    fn apply_jmap_resource_rewrites_origin_and_mcp_path() {
+        let mut pairs = vec![(
+            "resource".to_owned(),
+            "https://jmap-mcp.kampong.social/mcp".to_owned(),
+        )];
+        apply_jmap_resource(&mut pairs, "stalwart");
+        assert_eq!(pairs, vec![("resource".to_owned(), "stalwart".to_owned())]);
+        let mut pairs = vec![(
+            "resource".to_owned(),
+            "https://jmap-mcp.kampong.social/".to_owned(),
+        )];
+        apply_jmap_resource(&mut pairs, "stalwart");
+        assert_eq!(pairs, vec![("resource".to_owned(), "stalwart".to_owned())]);
     }
 
     #[test]
-    fn normalize_resource_strips_mcp_path() {
-        let mut a = "https://jmap-mcp.kampong.social/mcp".to_owned();
-        normalize_resource(&mut a);
-        assert_eq!(a, "https://jmap-mcp.kampong.social");
-        let mut b = "https://jmap-mcp.kampong.social/mcp/".to_owned();
-        normalize_resource(&mut b);
-        assert_eq!(b, "https://jmap-mcp.kampong.social");
+    fn apply_jmap_resource_inserts_when_missing() {
+        let mut pairs = vec![("scope".to_owned(), "openid".to_owned())];
+        apply_jmap_resource(&mut pairs, "stalwart");
+        assert_eq!(
+            pairs,
+            vec![
+                ("scope".to_owned(), "openid".to_owned()),
+                ("resource".to_owned(), "stalwart".to_owned()),
+            ]
+        );
     }
 
     #[test]
