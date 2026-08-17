@@ -130,7 +130,7 @@ impl Config {
         stalwart_jmap_base_url: impl Into<String>,
         bind_addr: SocketAddr,
     ) -> Result<Self> {
-        let resource_url = strip_trailing_slash(resource_url.into());
+        let resource_url = canonical_resource_origin(resource_url.into());
         let authorization_server = strip_trailing_slash(authorization_server.into());
         let stalwart_jmap_base_url = strip_trailing_slash(stalwart_jmap_base_url.into());
         validate_url(&resource_url, ENV_RESOURCE_URL)?;
@@ -234,6 +234,39 @@ fn require_env(key: &str) -> Result<String> {
     std::env::var(key).with_context(|| format!("required env var {key} is not set"))
 }
 
+/// Canonicalise `JMAP_MCP_RESOURCE_URL` to the bare **origin**, accepting
+/// either `https://host` or `https://host/mcp`.
+///
+/// Both spellings are natural to write — the public MCP endpoint really is
+/// `<origin>/mcp`, so operators reasonably set that — but `resource_url` is
+/// the base every other URL hangs off, and only the origin works for all of
+/// them:
+///
+/// * RFC 9728 `resource` is derived as `<origin>/mcp`
+///   ([`crate::oauth_metadata::mcp_resource`]) — an origin that already ended
+///   in `/mcp` would advertise `/mcp/mcp`.
+/// * The `WWW-Authenticate` challenge appends
+///   `/.well-known/oauth-protected-resource/mcp`.
+/// * RFC 8414 `issuer` must equal the origin the metadata is served from, and
+///   `authorization_endpoint`/`token_endpoint` are `<origin>/authorize` and
+///   `<origin>/token` — routes mounted at the origin, not under `/mcp`.
+/// * `/oauth/callback` is registered with Logto at the origin.
+/// * It is the JWT `aud` we validate, which Logto mints as the origin and
+///   which Stalwart's directory `requireAudience` must match byte-for-byte
+///   (a mismatch here is exactly the 2026-08 `InvalidAudience` outage).
+///
+/// So normalising here lets the env var carry either form while every derived
+/// URL stays correct, instead of silently doubling the path segment.
+fn canonical_resource_origin(raw: String) -> String {
+    let trimmed = strip_trailing_slash(raw);
+    match trimmed.strip_suffix("/mcp") {
+        // Guard against eating the whole value for a pathological input like
+        // `https:///mcp`; only strip when an origin remains.
+        Some(origin) if origin.contains("://") && !origin.ends_with('/') => origin.to_owned(),
+        _ => trimmed,
+    }
+}
+
 fn validate_url(url: &str, key: &str) -> Result<()> {
     if !url.starts_with("https://") && !url.starts_with("http://") {
         anyhow::bail!("{key} must be an absolute http(s) URL, got: {url}");
@@ -314,6 +347,90 @@ mod tests {
     #[test]
     fn strips_trailing_slash_on_resource_url() {
         assert_eq!(cfg().resource_url, "https://jmap-mcp.example.test");
+    }
+
+    fn cfg_with(resource_url: &str) -> Config {
+        Config::new(
+            resource_url,
+            "https://login.example.test/oidc",
+            "https://mail.example.test",
+            SocketAddr::from(([0, 0, 0, 0], 3000)),
+        )
+        .unwrap()
+    }
+
+    /// `JMAP_MCP_RESOURCE_URL` may be written with or without the `/mcp`
+    /// suffix — the public endpoint really is `<origin>/mcp`, so operators
+    /// reasonably set that. Both must canonicalise to the origin.
+    #[test]
+    fn resource_url_accepts_mcp_suffix() {
+        for raw in [
+            "https://jmap-mcp.kampong.social",
+            "https://jmap-mcp.kampong.social/",
+            "https://jmap-mcp.kampong.social/mcp",
+            "https://jmap-mcp.kampong.social/mcp/",
+        ] {
+            assert_eq!(
+                cfg_with(raw).resource_url,
+                "https://jmap-mcp.kampong.social",
+                "{raw} should canonicalise to the origin"
+            );
+        }
+    }
+
+    /// The whole point of normalising: every derived URL must come out
+    /// byte-identical whichever spelling the operator used. These are the
+    /// exact strings the contract pins.
+    #[test]
+    fn both_spellings_derive_identical_urls() {
+        let plain = cfg_with("https://jmap-mcp.kampong.social");
+        let suffixed = cfg_with("https://jmap-mcp.kampong.social/mcp");
+
+        // RFC 9728 resource — must be the origin + /mcp exactly once.
+        let resource = crate::oauth_metadata::mcp_resource(&suffixed.resource_url);
+        assert_eq!(resource, "https://jmap-mcp.kampong.social/mcp");
+        assert_eq!(
+            resource,
+            crate::oauth_metadata::mcp_resource(&plain.resource_url)
+        );
+
+        // WWW-Authenticate resource_metadata path.
+        let challenge = crate::oauth_metadata::www_authenticate_header(&suffixed.resource_url);
+        assert!(challenge.contains(
+            r#"resource_metadata="https://jmap-mcp.kampong.social/.well-known/oauth-protected-resource/mcp""#
+        ));
+        assert_eq!(
+            challenge,
+            crate::oauth_metadata::www_authenticate_header(&plain.resource_url)
+        );
+
+        // RFC 8414 issuer / authorize / token must stay on the origin, where
+        // the routes are actually mounted.
+        let meta = crate::oauth_metadata::AuthorizationServerMetadata::from_config(&suffixed);
+        assert_eq!(meta.issuer, "https://jmap-mcp.kampong.social");
+        assert_eq!(
+            meta.authorization_endpoint,
+            "https://jmap-mcp.kampong.social/authorize"
+        );
+        assert_eq!(meta.token_endpoint, "https://jmap-mcp.kampong.social/token");
+
+        // The JWT audience we validate — must match Logto's minted `aud` and
+        // Stalwart's `requireAudience` byte-for-byte.
+        assert_eq!(suffixed.resource_url, "https://jmap-mcp.kampong.social");
+    }
+
+    /// Only a whole trailing `/mcp` path segment is stripped.
+    #[test]
+    fn resource_url_keeps_other_paths_and_lookalikes() {
+        assert_eq!(
+            cfg_with("https://jmap-mcp.kampong.social/mcpx").resource_url,
+            "https://jmap-mcp.kampong.social/mcpx"
+        );
+        // The host itself contains "mcp" — must survive untouched.
+        assert_eq!(
+            cfg_with("https://jmap-mcp.kampong.social/mcp/mcp").resource_url,
+            "https://jmap-mcp.kampong.social/mcp"
+        );
     }
 
     #[test]
