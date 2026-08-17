@@ -132,7 +132,7 @@ fn build_router(
     );
 
     let initialize_limiter = Arc::new(InitializeLimiter::new(
-        session::SESSION_KEEP_ALIVE,
+        crate::rate_limit::INITIALIZE_REFILL_INTERVAL,
         MAX_INITIALIZES_PER_IDENTITY,
     ));
 
@@ -227,13 +227,45 @@ async fn initialize_rate_limit(
         .check(&bearer_hash, Some(identity.user_id.as_str()))
         .is_err()
     {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many MCP initialize requests; try again later\n",
-        )
-            .into_response();
+        return initialize_rate_limited();
     }
     next.run(request).await
+}
+
+/// 429 for a throttled `initialize`.
+///
+/// Shaped as a JSON-RPC error rather than bare text: the client posted a
+/// JSON-RPC `initialize`, and one that cannot parse the response has no way
+/// to distinguish throttling from a broken server — it reports a dead
+/// connector. `Retry-After` (seconds, per the bucket's refill rate) tells a
+/// well-behaved client exactly how long to wait. `id` is null because the
+/// body is not parsed at this layer (JSON-RPC 2.0 §5 allows null when the id
+/// cannot be determined).
+fn initialize_rate_limited() -> axum::response::Response {
+    let retry_after = crate::rate_limit::INITIALIZE_REFILL_INTERVAL.as_secs();
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": serde_json::Value::Null,
+        "error": {
+            "code": crate::audit::RATE_LIMITED_CODE,
+            "message": format!(
+                "Too many MCP session initializations for this identity. \
+                 Retry in {retry_after}s; reuse the existing session where possible."
+            ),
+        },
+    });
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            (axum::http::header::RETRY_AFTER, retry_after.to_string()),
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_owned(),
+            ),
+        ],
+        axum::Json(body),
+    )
+        .into_response()
 }
 
 fn is_fresh_mcp_session_request(request: &Request<Body>) -> bool {
@@ -361,6 +393,53 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(www.contains("oauth-protected-resource/mcp"));
+    }
+
+    /// A throttled initialize must be machine-readable: JSON-RPC body so the
+    /// client can tell throttling from a broken server, and `Retry-After` so
+    /// it backs off instead of hammering or declaring the connector dead.
+    #[tokio::test]
+    async fn initialize_429_is_json_rpc_with_retry_after() {
+        let r = initialize_rate_limited();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let retry_after = r
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("Retry-After present")
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .expect("Retry-After is an integer number of seconds");
+        assert_eq!(
+            retry_after,
+            crate::rate_limit::INITIALIZE_REFILL_INTERVAL.as_secs()
+        );
+
+        let bytes = axum::body::to_bytes(r.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON-RPC body");
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["error"]["code"], crate::audit::RATE_LIMITED_CODE);
+    }
+
+    /// The initialize bucket must absorb an ordinary reconnect storm. Cursor
+    /// alone opens two sessions per connect, so a handful of connects cannot
+    /// be allowed to lock the identity out of its first tool call.
+    #[test]
+    fn initialize_burst_absorbs_repeated_reconnects() {
+        let limiter = crate::rate_limit::InitializeLimiter::new(
+            crate::rate_limit::INITIALIZE_REFILL_INTERVAL,
+            MAX_INITIALIZES_PER_IDENTITY,
+        );
+        // Ten back-to-back connects at two sessions each: all must pass.
+        for i in 0..20 {
+            assert!(
+                limiter.check("bearer-hash", Some("user-sub")).is_ok(),
+                "initialize {i} should not be throttled"
+            );
+        }
     }
 
     #[tokio::test]

@@ -21,7 +21,7 @@ use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tracing::{Instrument as _, Span};
+use tracing::{Instrument as _, Span, warn};
 
 use crate::audit::{self, outcome};
 use crate::audit_mailbox::AuditMailboxRegistry;
@@ -96,9 +96,25 @@ impl JmapMcpService {
         }
     }
 
-    /// On a JMAP auth-expiry error (`AUTH_EXPIRED_CODE`), evict the cached
-    /// JMAP session + Logto validation entry and rewrite the error to an
-    /// actionable reconnect message. Cheap no-op on the happy path.
+    /// React to a Stalwart auth rejection (`AUTH_EXPIRED_CODE` out of
+    /// [`map_jmap_err`]) by evicting the stale JMAP session and rewriting the
+    /// error into something the caller can act on. Cheap no-op on the happy
+    /// path.
+    ///
+    /// Stalwart answers 401/403 for two very different situations and the
+    /// bearer alone cannot tell them apart, so we ask *our own* validation
+    /// instead: a tool handler is only reachable after `bearer_auth` verified
+    /// the JWT's signature, issuer, audience and `exp`, so the identity's
+    /// `exp` says whether the credential was actually live at the moment
+    /// Stalwart refused it.
+    ///
+    /// * `exp` in the future → the token is fine and the mail backend is
+    ///   refusing it for its own reasons (audience policy, directory config,
+    ///   account disabled). Reconnecting re-runs the same OAuth flow and
+    ///   yields an equivalent token that fails identically — so we must not
+    ///   ask for it, and we keep the Logto validation cache intact.
+    /// * `exp` past/imminent → genuine expiry, where reconnecting is exactly
+    ///   the right advice and the cached validation must go.
     #[allow(clippy::unused_async)] // async for a uniform interface; callers `.await` it
     async fn react_to_auth_expiry(
         &self,
@@ -109,9 +125,36 @@ impl JmapMcpService {
         if err.code.0 != audit::AUTH_EXPIRED_CODE {
             return;
         }
-        if let Some(AccessToken(token)) = token_from_ctx(ctx) {
-            self.jmap.evict(&token);
-            self.logto.drop_token(&token);
+        let token = token_from_ctx(ctx);
+        // The cached JMAP session was discovered with a credential Stalwart
+        // has now refused; drop it either way so the next call re-discovers.
+        if let Some(AccessToken(token)) = &token {
+            self.jmap.evict(token);
+        }
+
+        if identity_from_ctx(ctx).is_some_and(|id| token_is_live(id.exp)) {
+            warn!(
+                "Stalwart rejected a bearer that is still valid by our own \
+                 validation — check the JMAP directory's audience policy"
+            );
+            *err = ErrorData::new(
+                rmcp::model::ErrorCode(audit::UPSTREAM_AUTH_REJECTED_CODE),
+                "The mail backend refused this request's credential, but the \
+                 credential itself is still valid and has not expired — so \
+                 reconnecting will not fix it and will fail the same way. \
+                 This is a server-side problem between jmap-mcp and the JMAP \
+                 backend (most often the backend's token audience policy). \
+                 Report it to the jmap-mcp operator rather than retrying."
+                    .to_owned(),
+                None,
+            );
+            return;
+        }
+
+        // Genuinely expired: forget the cached validation so the next
+        // presentation of this token is re-checked from scratch.
+        if let Some(AccessToken(token)) = &token {
+            self.logto.drop_token(token);
         }
         *err = ErrorData::new(
             rmcp::model::ErrorCode(audit::AUTH_EXPIRED_CODE),
@@ -191,6 +234,31 @@ fn structured_result<T: Serialize>(value: &T) -> Result<rmcp::model::CallToolRes
     let json = serde_json::to_value(value)
         .map_err(|e| ErrorData::internal_error(format!("serialize tool result: {e}"), None))?;
     Ok(rmcp::model::CallToolResult::structured(json))
+}
+
+/// Clock skew allowed when deciding whether a validated token was still live
+/// at the moment the mail backend refused it.
+///
+/// A token inside this window of its `exp` is treated as expired: expiry is
+/// the benign, self-healing explanation, so on a genuinely ambiguous boundary
+/// we prefer "reconnect" over accusing the backend of misconfiguration.
+const EXPIRY_SKEW_SECS: i64 = 60;
+
+/// Was this token still live when the backend rejected it?
+///
+/// `None` (no `exp` claim) is treated as *not* live — without an expiry we
+/// cannot rule expiry out, so we fall back to the recoverable advice.
+fn token_is_live(exp: Option<i64>) -> bool {
+    exp.is_some_and(|exp| exp - now_unix() > EXPIRY_SKEW_SECS)
+}
+
+fn now_unix() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+    )
+    .unwrap_or(i64::MAX)
 }
 
 fn missing_identity_err() -> ErrorData {
@@ -1099,6 +1167,44 @@ mod tests {
     #[test]
     fn default_limit_sensible() {
         assert!((10..=MAX_EMAIL_LIMIT).contains(&default_email_limit()));
+    }
+
+    /// A token with real time left on it was NOT expired when the backend
+    /// refused it — the case that must not tell the user to reconnect.
+    #[test]
+    fn live_token_is_not_treated_as_expired() {
+        assert!(token_is_live(Some(now_unix() + 3600)));
+    }
+
+    /// Past expiry, and inside the skew window, both count as expired: on a
+    /// genuinely ambiguous boundary we prefer the recoverable advice.
+    #[test]
+    fn expired_and_near_expiry_tokens_are_not_live() {
+        assert!(!token_is_live(Some(now_unix() - 1)));
+        assert!(!token_is_live(Some(now_unix() - 3600)));
+        assert!(!token_is_live(Some(now_unix() + EXPIRY_SKEW_SECS / 2)));
+    }
+
+    /// No `exp` claim → cannot rule expiry out → fall back to "reconnect".
+    #[test]
+    fn missing_exp_is_not_live() {
+        assert!(!token_is_live(None));
+    }
+
+    /// The two conditions must carry distinct JSON-RPC codes: a client (and
+    /// a Loki query) has to tell "reconnect fixes this" apart from
+    /// "reconnecting is futile, the backend is misconfigured".
+    #[test]
+    fn upstream_rejection_and_expiry_codes_are_distinct() {
+        assert_ne!(audit::UPSTREAM_AUTH_REJECTED_CODE, audit::AUTH_EXPIRED_CODE);
+        assert_eq!(
+            audit::error_class(&ErrorData::new(
+                rmcp::model::ErrorCode(audit::UPSTREAM_AUTH_REJECTED_CODE),
+                "x".to_owned(),
+                None,
+            )),
+            "upstream_auth_rejected"
+        );
     }
 
     #[test]

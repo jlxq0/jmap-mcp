@@ -50,6 +50,16 @@ pub const RATE_LIMITED_CODE: i32 = -32029;
 /// JSON-RPC application code: the Logto bearer expired / was rejected by
 /// Stalwart. Used by `react_to_auth_expiry` to mark the rewritten error.
 pub const AUTH_EXPIRED_CODE: i32 = -32028;
+/// JSON-RPC application code: Stalwart refused a bearer that *we* validated
+/// successfully and that has not yet expired.
+///
+/// This is emphatically **not** session expiry, and the distinction is the
+/// whole point of the code: reconnecting mints an equivalent token and fails
+/// identically, so telling the user to reconnect sends them into a loop.
+/// Seen 2026-08 when Stalwart's directory carried `requireAudience=stalwart`
+/// while Logto minted `aud` = the resource URL — every JMAP call answered
+/// `JWT validation failed: InvalidAudience` against a perfectly live bearer.
+pub const UPSTREAM_AUTH_REJECTED_CODE: i32 = -32027;
 
 #[must_use]
 pub const fn error_class(err: &ErrorData) -> &'static str {
@@ -61,6 +71,7 @@ pub const fn error_class(err: &ErrorData) -> &'static str {
         -32603 => "internal",
         RATE_LIMITED_CODE => "rate_limited",
         AUTH_EXPIRED_CODE => "auth_expired",
+        UPSTREAM_AUTH_REJECTED_CODE => "upstream_auth_rejected",
         _ => "other",
     }
 }

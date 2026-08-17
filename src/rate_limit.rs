@@ -48,12 +48,32 @@ use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 
-/// Maximum number of fresh MCP sessions a single bearer token or MAS
-/// subject may open in a short burst. Legitimate Claude usage normally
-/// needs one or two live sessions; this leaves headroom for reconnects
-/// while preventing one authenticated identity from filling the global
-/// session pool (`session::MAX_SESSIONS`).
-pub const MAX_INITIALIZES_PER_IDENTITY: u32 = 8;
+/// Maximum number of fresh MCP sessions a single bearer token or Logto
+/// subject may open in a short burst, before the refill in
+/// [`INITIALIZE_REFILL_INTERVAL`] paces them.
+///
+/// Sized from observed client behaviour, not from an ideal: Cursor opens
+/// **two** sessions within one second of a single connect, and every client
+/// re-initializes after any transport-level failure. At the old burst of 8
+/// (refilling once per 30-minute session TTL) four ordinary connects
+/// exhausted the bucket and the fifth got a 30-minute lockout — surfacing to
+/// the user as a dead connector on their *first* tool call, which is exactly
+/// the failure this limiter must not cause.
+///
+/// The global [`crate::session::MAX_SESSIONS`] cap (256) remains the real
+/// bound on the session pool; this limiter only paces one identity.
+pub const MAX_INITIALIZES_PER_IDENTITY: u32 = 32;
+
+/// Refill rate for the initialize bucket: one slot per minute.
+///
+/// Decoupled from `session::SESSION_KEEP_ALIVE`. Tying refill to the session
+/// TTL sounded principled but meant a client that legitimately churned
+/// sessions waited half an hour for a single retry. At 1/min a flooding
+/// identity sustains ~30 concurrent sessions against a 30-minute idle TTL —
+/// comfortably inside the 256-session cap — while a real user's reconnect
+/// storm clears in seconds.
+#[allow(clippy::duration_suboptimal_units)] // `from_hours`/`from_mins` unstable on 1.93
+pub const INITIALIZE_REFILL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Limiter type alias — `governor`'s direct (non-keyed) variant; we
 /// build one per identity and hand it out keyed by bearer-hash or sub.
@@ -179,11 +199,12 @@ pub struct InitializeLimiter {
 
 impl InitializeLimiter {
     /// New limiter that allows up to `burst` initialize calls back-to-back
-    /// and then refills one token every `replenish_1_per`. Pairing the
-    /// refill period with `session::SESSION_KEEP_ALIVE` means once an
-    /// attacker has filled their slots they can only open a new one as
-    /// fast as their existing ones idle out — exactly the timescale of
-    /// the global session-pool cap.
+    /// and then refills one token every `replenish_1_per`.
+    ///
+    /// Callers pass [`INITIALIZE_REFILL_INTERVAL`]; see
+    /// [`MAX_INITIALIZES_PER_IDENTITY`] for why the burst and refill are
+    /// sized to real client reconnect behaviour rather than to the session
+    /// TTL. The global session cap, not this limiter, bounds the pool.
     #[must_use]
     pub fn new(replenish_1_per: Duration, burst: u32) -> Self {
         let burst = NonZeroU32::new(burst).unwrap_or(NonZeroU32::MIN);

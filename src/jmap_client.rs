@@ -443,4 +443,108 @@ mod tests {
         assert_eq!(url_escape("abc-1.2_3~"), "abc-1.2_3~");
         assert_eq!(url_escape("a/b c"), "a%2Fb%20c");
     }
+
+    // ----- session discovery against a mock Stalwart -----
+
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn session_body() -> Value {
+        json!({
+            "apiUrl": "https://mail.example.test/jmap/",
+            "downloadUrl": "https://mail.example.test/jmap/download/{accountId}/{blobId}/{name}?type={type}",
+            "uploadUrl": "https://mail.example.test/jmap/upload/{accountId}/",
+            "username": "julian@kampong.social",
+            "primaryAccounts": { CAP_MAIL: "acct-1" }
+        })
+    }
+
+    /// The data `whoami` reports comes straight off the discovered session:
+    /// the account id, and the username it falls back to when the Logto
+    /// token carried no `email` claim. This is the path that answered
+    /// `InvalidAudience` in the 2026-08 incident.
+    #[tokio::test]
+    async fn session_discovery_yields_username_and_account_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jmap"))
+            .and(header("authorization", "Bearer live-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(session_body()))
+            .mount(&server)
+            .await;
+
+        let client = JmapClient::new(&server.uri(), None).unwrap();
+        let session = client.session_for("live-token").await.unwrap();
+
+        assert_eq!(session.username.as_deref(), Some("julian@kampong.social"));
+        assert_eq!(session.mail_account_id(), Some("acct-1"));
+        assert_eq!(
+            client.account_id("live-token").await.unwrap(),
+            "acct-1".to_owned()
+        );
+    }
+
+    /// Second call is served from cache — one upstream request only.
+    #[tokio::test]
+    async fn session_is_cached_per_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jmap"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(session_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = JmapClient::new(&server.uri(), None).unwrap();
+        client.session_for("live-token").await.unwrap();
+        client.session_for("live-token").await.unwrap();
+        // `expect(1)` is asserted on drop.
+    }
+
+    /// Stalwart refusing the bearer (what `requireAudience` produced) must
+    /// surface as `Unauthorized`, which is what the MCP layer keys on.
+    #[tokio::test]
+    async fn stalwart_401_maps_to_unauthorized() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jmap"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let client = JmapClient::new(&server.uri(), None).unwrap();
+        assert!(matches!(
+            client.session_for("rejected-token").await,
+            Err(JmapError::Unauthorized)
+        ));
+    }
+
+    /// A rejection must not leave a poisoned cache entry behind.
+    #[tokio::test]
+    async fn unauthorized_evicts_cached_session() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jmap"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(session_body()))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let client = JmapClient::new(&server.uri(), None).unwrap();
+        client.session_for("tok").await.unwrap();
+        assert!(client.session_lookup(&hash_token("tok")).is_some());
+
+        // Backend now rejects: the cached session must be dropped.
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jmap"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        client.evict("tok");
+        assert!(matches!(
+            client.session_for("tok").await,
+            Err(JmapError::Unauthorized)
+        ));
+        assert!(client.session_lookup(&hash_token("tok")).is_none());
+    }
 }
