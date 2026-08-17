@@ -12,10 +12,10 @@ against [Logto](https://logto.io) (JWKS + RS256), then forwarded verbatim to
 Stalwart as the JMAP credential — a pure pass-through, no stored mailbox
 passwords.
 
-Ported from [`matrix-mcp`](https://forge.oddie.app/julian/matrix-mcp): same
-Rust + `axum` + `rmcp` stack, same distroless image, same Gruyere/ArgoCD
-hosting — with Matrix's E2EE/cross-signing machinery replaced by a stateless
-JMAP client (there is no per-user store, no PVC).
+Ported from [`matrix-mcp`](https://github.com/jlxq0/matrix-mcp): same
+Rust + `axum` + `rmcp` stack and the same distroless image — with Matrix's
+E2EE/cross-signing machinery replaced by a stateless JMAP client (there is
+no per-user store, no PVC).
 
 ## What you get
 
@@ -65,7 +65,7 @@ docker run --rm -p 3000:3000 \
   -e JMAP_MCP_AUTHORIZATION_SERVER=https://login.your-domain.example/oidc \
   -e JMAP_MCP_STALWART_JMAP_BASE_URL=https://mail.your-domain.example \
   -e JMAP_MCP_OAUTH_REDIRECT_URIS=https://client.example/oauth/callback \
-  forge.oddie.app/jlxq0/jmap-mcp:latest
+  your-registry.example/jmap-mcp:latest
 ```
 
 Then point a public HTTPS hostname at it (claude.ai requires `https://`).
