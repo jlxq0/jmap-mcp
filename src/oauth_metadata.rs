@@ -55,9 +55,15 @@ pub struct ProtectedResourceMetadata {
 /// origin; stricter clients (Grok Bot, LangDock) reject a token whose
 /// advertised resource is the origin when they connected to `{origin}/mcp`.
 ///
-/// `cfg.resource_url` stays the origin: it is the JWT audience Logto issues,
-/// the RFC 8414 issuer, and the `/oauth/callback` base. Do not change
-/// `JMAP_MCP_RESOURCE_URL` to include `/mcp`.
+/// `cfg.resource_url` is always the bare origin: it is the JWT audience Logto
+/// issues (and that Stalwart's directory `requireAudience` must match
+/// byte-for-byte), the RFC 8414 issuer, and the `/oauth/callback` base.
+///
+/// `JMAP_MCP_RESOURCE_URL` may be *written* either way — `canonical_resource_origin`
+/// in `config.rs` strips a trailing `/mcp` — but it always lands here as the
+/// origin, so this function appends `/mcp` exactly once. Do not "simplify"
+/// this by dropping the append when the env var already carries the suffix:
+/// the suffix is normalised away before it reaches any config field.
 pub fn mcp_resource(resource_url: &str) -> String {
     format!("{}/mcp", resource_url.trim_end_matches('/'))
 }

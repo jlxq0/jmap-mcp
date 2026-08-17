@@ -73,6 +73,18 @@ Set `JMAP_MCP_OAUTH_REDIRECT_URIS` to the exact comma-separated redirect URI
 allowlist configured on the pre-provisioned Logto public client; the OAuth proxy
 rejects authorization and DCR requests for any other redirect URI.
 
+`JMAP_MCP_RESOURCE_URL` may be written as either the origin
+(`https://jmap-mcp.example`) or the MCP endpoint
+(`https://jmap-mcp.example/mcp`); a trailing `/mcp` is normalised away. It is
+stored as the origin, because it is also the JWT audience, the RFC 8414
+issuer, and the `/oauth/callback` base. The RFC 9728 `resource` advertised to
+clients is always `<origin>/mcp` regardless of which form you set.
+
+> **Audience alignment.** The JWT `aud` your IdP mints for this resource, and
+> the mail backend's required audience (Stalwart directory `requireAudience`),
+> must both equal that **origin** — byte-for-byte. A mismatch authenticates
+> fine at jmap-mcp and then fails every JMAP call.
+
 ## Security
 
 jmap-mcp gives claude.ai access to your email — that's the point. You extend
