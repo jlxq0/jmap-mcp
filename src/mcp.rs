@@ -1067,13 +1067,28 @@ impl JmapMcpService {
             .find(|(n, _, _)| n == "Identity/get")
             .and_then(|(_, p, _)| p.get("list").and_then(Value::as_array).cloned())
             .unwrap_or_default();
+        // Case-insensitive: addresses are not case-sensitive in practice and
+        // the server echoes whatever case the identity was stored with, so an
+        // exact `==` rejects a correct address on a capitalisation mismatch.
+        let wanted = from.trim().to_ascii_lowercase();
         list.iter()
-            .find(|i| i.get("email").and_then(Value::as_str) == Some(from))
+            .find(|i| {
+                i.get("email")
+                    .and_then(Value::as_str)
+                    .is_some_and(|e| e.to_ascii_lowercase() == wanted)
+            })
             .and_then(|i| i.get("id").and_then(Value::as_str))
             .map(ToOwned::to_owned)
             .ok_or_else(|| {
+                let available: Vec<&str> = list
+                    .iter()
+                    .filter_map(|i| i.get("email").and_then(Value::as_str))
+                    .collect();
                 ErrorData::invalid_params(
-                    format!("no sending identity matches from-address {from}"),
+                    format!(
+                        "no sending identity matches from-address {from}; available: {}",
+                        available.join(", ")
+                    ),
                     None,
                 )
             })
