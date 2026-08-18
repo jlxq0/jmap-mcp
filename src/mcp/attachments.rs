@@ -362,8 +362,15 @@ impl JmapMcpService {
                 .ok_or_else(|| ErrorData::internal_error("no Drafts mailbox found", None))?;
             let sent = Self::role_mailbox(&mailboxes, "sent");
 
-            let identity_id = self
-                .identity_id_for(&token.0, &account_id, &params.from)
+            let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
+            let (from_addr, identity_id) = self
+                .resolve_submission_identity(
+                    &token.0,
+                    &account_id,
+                    Some(&params.from),
+                    &[],
+                    session_email.as_deref(),
+                )
                 .await?;
 
             // Fetch + upload the attachment before composing the draft.
@@ -381,7 +388,7 @@ impl JmapMcpService {
             let email_obj = json!({
                 "mailboxIds": { drafts.clone(): true },
                 "keywords": { "$draft": true, "$seen": true },
-                "from": [ { "email": params.from } ],
+                "from": [ { "email": from_addr } ],
                 "to": to_addrs,
                 "subject": params.subject,
                 "bodyValues": { "b": { "value": params.body, "isTruncated": false } },

@@ -11,6 +11,7 @@
 //! Every tool forwards the caller's Logto bearer verbatim to Stalwart via the
 //! `JmapClient` (pass-through model). There is no per-user server-side state.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,7 +22,7 @@ use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tracing::{Instrument as _, Span, warn};
+use tracing::{Instrument as _, Span, debug, warn};
 
 use crate::audit::{self, outcome};
 use crate::audit_mailbox::AuditMailboxRegistry;
@@ -48,6 +49,10 @@ mod spam;
 const MAX_EMAIL_LIMIT: u32 = 50;
 const MAX_BODY_VALUE_BYTES: u64 = 512 * 1024;
 const MAX_TEXT_BODY_BYTES: usize = 256 * 1024;
+
+/// Stalwart's JMAP extension namespace. Carries `x:Account` / `x:Domain`,
+/// the only place the principal's alias list is exposed.
+const CAP_STALWART: &str = "urn:stalwart:jmap";
 
 /// The MCP service. Cheap to clone (inner `Arc`s / `Clone` clients).
 #[derive(Clone)]
@@ -261,6 +266,245 @@ fn now_unix() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
+/// An address this mailbox owns. `identity_id` is `None` for an alias that
+/// has no JMAP Identity object of its own.
+#[derive(Clone, Debug)]
+pub struct OwnedAddress {
+    pub email: String,
+    pub identity_id: Option<String>,
+    pub name: Option<String>,
+}
+
+/// Local-parts that denote a shared/role mailbox rather than a person.
+///
+/// RFC 2142 defines most of these; the rest are conventional shared inboxes
+/// seen on this deployment (`team@`, `support@`, `noreply@`, …). They exist to
+/// receive, and a personal message sent as one misattributes its author, so
+/// they are refused as a `From`.
+const ROLE_LOCAL_PARTS: &[&str] = &[
+    "abuse",
+    "admin",
+    "administrator",
+    "billing",
+    "bounces",
+    "contact",
+    "dmarc",
+    "help",
+    "hostmaster",
+    "info",
+    "mailer-daemon",
+    "marketing",
+    "no-reply",
+    "noc",
+    "noreply",
+    "postmaster",
+    "root",
+    "sales",
+    "security",
+    "support",
+    "team",
+    "usenet",
+    "uucp",
+    "webmaster",
+    "www",
+];
+
+/// Is this a shared/role address rather than a person's?
+pub fn is_role_address(email: &str) -> bool {
+    let local = email
+        .split('@')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    ROLE_LOCAL_PARTS.contains(&local.as_str())
+}
+
+/// Decide which of the mailbox's owned addresses to send as.
+///
+/// Never consults list order — an `Identity/get` list arrives in whatever
+/// order the server chose, and on this deployment a shared `team@` address
+/// sits first, so `[0]` is a wrong answer waiting to happen.
+///
+/// Priority: explicit `from` → an address in `preferred` (e.g. the address a
+/// message being replied to was delivered to) → the signed-in user. If none
+/// apply, refuse and name the options rather than guess.
+///
+/// Role addresses are refused as a `From` in every path: they are shared
+/// receiving inboxes, and sending as one misattributes a personal message.
+/// Aliases without an Identity object are accepted — submission borrows a
+/// personal identity while `From` carries the alias.
+fn choose_from_address(
+    owned: &[OwnedAddress],
+    explicit_from: Option<&str>,
+    preferred: &[String],
+    session_email: Option<&str>,
+) -> Result<(String, String), ErrorData> {
+    if owned.is_empty() {
+        return Err(ErrorData::invalid_params(
+            "this account has no sending addresses configured",
+            None,
+        ));
+    }
+    let find = |want: &str| {
+        owned
+            .iter()
+            .find(|a| a.email.eq_ignore_ascii_case(want.trim()))
+            .cloned()
+    };
+
+    let chosen = if let Some(want) = explicit_from.map(str::trim).filter(|s| !s.is_empty()) {
+        let found = find(want).ok_or_else(|| {
+            ErrorData::invalid_params(
+                format!(
+                    "{want} is not an address on this mailbox. Sendable addresses: {}",
+                    sendable_list(owned)
+                ),
+                None,
+            )
+        })?;
+        if is_role_address(&found.email) {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "{} is a shared role address and must not be used as a personal From. \
+                     Sendable addresses: {}",
+                    found.email,
+                    sendable_list(owned)
+                ),
+                None,
+            ));
+        }
+        found
+    } else {
+        preferred
+            .iter()
+            .filter_map(|c| find(c))
+            .find(|a| !is_role_address(&a.email))
+            .or_else(|| {
+                session_email
+                    .and_then(find)
+                    .filter(|a| !is_role_address(&a.email))
+            })
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!(
+                        "cannot determine which address to send as — pass `from` explicitly. \
+                         Sendable addresses: {}",
+                        sendable_list(owned)
+                    ),
+                    None,
+                )
+            })?
+    };
+
+    let identity_id = match chosen.identity_id.clone() {
+        Some(id) => id,
+        None => fallback_identity_id(owned, session_email).ok_or_else(|| {
+            ErrorData::invalid_params(
+                format!(
+                    "{} is an alias on this mailbox, but no personal identity exists to submit \
+                     it under",
+                    chosen.email
+                ),
+                None,
+            )
+        })?,
+    };
+    Ok((chosen.email, identity_id))
+}
+
+/// Comma-separated non-role addresses, for error messages.
+fn sendable_list(owned: &[OwnedAddress]) -> String {
+    let mut v: Vec<&str> = owned
+        .iter()
+        .filter(|a| !is_role_address(&a.email))
+        .map(|a| a.email.as_str())
+        .collect();
+    v.sort_unstable();
+    if v.is_empty() {
+        return "(none)".to_owned();
+    }
+    v.join(", ")
+}
+
+/// An identity id to submit an alias under: prefer the session user's own
+/// identity, else any non-role identity.
+fn fallback_identity_id(owned: &[OwnedAddress], session_email: Option<&str>) -> Option<String> {
+    if let Some(me) = session_email
+        && let Some(id) = owned
+            .iter()
+            .find(|a| a.email.eq_ignore_ascii_case(me) && a.identity_id.is_some())
+            .and_then(|a| a.identity_id.clone())
+    {
+        return Some(id);
+    }
+    owned
+        .iter()
+        .find(|a| a.identity_id.is_some() && !is_role_address(&a.email))
+        .and_then(|a| a.identity_id.clone())
+}
+
+/// `list` array of a named method response.
+fn method_list(resps: &[(String, Value, String)], method: &str) -> Vec<Value> {
+    resps
+        .iter()
+        .find(|(n, _, _)| n == method)
+        .and_then(|(_, p, _)| p.get("list").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+}
+
+/// `domainId` → domain name, from an `x:Domain/get` response.
+fn domain_map(resps: &[(String, Value, String)]) -> HashMap<String, String> {
+    method_list(resps, "x:Domain/get")
+        .iter()
+        .filter_map(|d| Some((str_field(d, "id")?, str_field(d, "name")?)))
+        .collect()
+}
+
+/// Does this principal object represent `username`?
+fn principal_is(account: &Value, username: &str) -> bool {
+    let local = username.split('@').next().unwrap_or(username);
+    [
+        str_field(account, "email"),
+        str_field(account, "name"),
+        str_field(account, "description"),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|v| v.eq_ignore_ascii_case(username) || v.eq_ignore_ascii_case(local))
+}
+
+/// Expand a principal's `aliases` map into full addresses.
+///
+/// Stalwart stores each alias as `{name, domainId}`, so the address only
+/// exists once the domain is resolved — which is why a plain search for
+/// `user@domain` never finds one. Disabled aliases are skipped.
+fn aliases_of(account: &Value, domains: &HashMap<String, String>) -> Vec<OwnedAddress> {
+    let Some(aliases) = account.get("aliases").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for alias in aliases.values() {
+        if alias.get("enabled").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
+        let (Some(name), Some(domain_id)) =
+            (str_field(alias, "name"), str_field(alias, "domainId"))
+        else {
+            continue;
+        };
+        let Some(domain) = domains.get(&domain_id) else {
+            continue;
+        };
+        out.push(OwnedAddress {
+            email: format!("{name}@{domain}"),
+            identity_id: None,
+            name: str_field(alias, "description"),
+        });
+    }
+    out.sort_by(|a, b| a.email.cmp(&b.email));
+    out
+}
+
 fn missing_identity_err() -> ErrorData {
     ErrorData::internal_error("no authenticated identity in request context", None)
 }
@@ -445,9 +689,15 @@ pub struct WhoamiResult {
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct Identity {
-    pub id: String,
+    /// JMAP Identity id, or `null` for an alias that has no Identity object.
+    /// Sending from such an alias still works — it is submitted under the
+    /// caller's own identity while `From` carries the alias.
+    pub id: Option<String>,
     pub email: String,
     pub name: Option<String>,
+    /// True for a shared/role address (`postmaster@`, `team@`, …). These are
+    /// listed for completeness but refused as a `From`.
+    pub role: bool,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -613,34 +863,26 @@ impl JmapMcpService {
             self.rate_limit_check(&ctx, Category::Read)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
             let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
-            let resps = self
-                .jmap
-                .call(
-                    &token.0,
-                    &[CAP_CORE, "urn:ietf:params:jmap:submission"],
-                    vec![(
-                        "Identity/get",
-                        json!({ "accountId": account_id, "ids": Value::Null }),
-                        "i",
-                    )],
-                )
-                .await
-                .map_err(map_jmap_err)?;
-            let list = resps
+            let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
+            // Identities alone are not the mailbox's address list: personal
+            // aliases have no Identity object, so they must be merged in or
+            // they are invisible here and unusable as a From.
+            let owned = self
+                .owned_addresses(&token.0, &account_id, session_email.as_deref())
+                .await;
+            let mut identities: Vec<Identity> = owned
                 .into_iter()
-                .find(|(n, _, _)| n == "Identity/get")
-                .and_then(|(_, p, _)| p.get("list").and_then(Value::as_array).cloned())
-                .unwrap_or_default();
-            let identities: Vec<Identity> = list
-                .iter()
-                .filter_map(|i| {
-                    Some(Identity {
-                        id: str_field(i, "id")?,
-                        email: str_field(i, "email")?,
-                        name: str_field(i, "name"),
-                    })
+                .map(|a| Identity {
+                    role: is_role_address(&a.email),
+                    id: a.identity_id,
+                    email: a.email,
+                    name: a.name,
                 })
                 .collect();
+            // Personal addresses first, then role addresses; alphabetical
+            // within each group. Nothing downstream may depend on list order
+            // for choosing a From, but a stable, sensible order helps callers.
+            identities.sort_by(|a, b| a.role.cmp(&b.role).then_with(|| a.email.cmp(&b.email)));
             let n = identities.len();
             Ok::<_, ErrorData>((structured_result(&IdentitiesResult { identities }), n))
         }
@@ -939,9 +1181,18 @@ impl JmapMcpService {
                 .ok_or_else(|| ErrorData::internal_error("no Drafts mailbox found", None))?;
             let sent = Self::role_mailbox(&mailboxes, "sent");
 
-            // Resolve the sending identity by from-address.
-            let identity_id = self
-                .identity_id_for(&token.0, &account_id, &params.from)
+            // Resolve the sending identity by from-address. Accepts any
+            // address the mailbox owns, including aliases with no Identity
+            // object; refuses shared role addresses.
+            let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
+            let (from_addr, identity_id) = self
+                .resolve_submission_identity(
+                    &token.0,
+                    &account_id,
+                    Some(&params.from),
+                    &[],
+                    session_email.as_deref(),
+                )
                 .await?;
 
             let to_addrs: Vec<Value> = params.to.iter().map(|e| json!({ "email": e })).collect();
@@ -951,7 +1202,7 @@ impl JmapMcpService {
             let mut email_obj = json!({
                 "mailboxIds": { drafts.clone(): true },
                 "keywords": { "$draft": true, "$seen": true },
-                "from": [ { "email": params.from } ],
+                "from": [ { "email": from_addr } ],
                 "to": to_addrs,
                 "subject": params.subject,
                 "bodyValues": { "b": { "value": params.body_text, "isTruncated": false } },
@@ -1042,13 +1293,55 @@ impl JmapMcpService {
 }
 
 impl JmapMcpService {
-    /// Resolve the Identity id whose `email` matches `from`.
-    async fn identity_id_for(
+    /// Every address this mailbox owns: the JMAP identities **plus** the
+    /// principal's aliases.
+    ///
+    /// `Identity/get` is not the mailbox's address list. On the account this
+    /// was built against it returns 11 entries — 8 of them role addresses —
+    /// while the principal carries 552 aliases. Personal addresses such as
+    /// `julian@lindner.earth` are enabled aliases with no Identity object, so
+    /// an identities-only view both hides them and leaves a role address
+    /// (`team@…`) sitting at the top of the list.
+    ///
+    /// Aliases come from Stalwart's `urn:stalwart:jmap` extension, which
+    /// stores them as `{name, domainId}` pairs, so domains are resolved in the
+    /// same batch. The whole call is **best-effort**: if the extension is
+    /// unavailable or the caller may not read its own principal, this degrades
+    /// to the identity list rather than failing the tool.
+    async fn owned_addresses(
         &self,
         token: &str,
         account_id: &str,
-        from: &str,
-    ) -> Result<String, ErrorData> {
+        session_username: Option<&str>,
+    ) -> Vec<OwnedAddress> {
+        let mut out: Vec<OwnedAddress> = Vec::new();
+
+        // Identities first: these carry the id EmailSubmission needs.
+        if let Ok(identities) = self.identity_list(token, account_id).await {
+            for i in &identities {
+                if let (Some(email), Some(id)) = (str_field(i, "email"), str_field(i, "id")) {
+                    out.push(OwnedAddress {
+                        email,
+                        identity_id: Some(id),
+                        name: str_field(i, "name"),
+                    });
+                }
+            }
+        }
+
+        for alias in self.principal_aliases(token, session_username).await {
+            if !out
+                .iter()
+                .any(|a| a.email.eq_ignore_ascii_case(&alias.email))
+            {
+                out.push(alias);
+            }
+        }
+        out
+    }
+
+    /// Raw `Identity/get` list.
+    async fn identity_list(&self, token: &str, account_id: &str) -> Result<Vec<Value>, ErrorData> {
         let resps = self
             .jmap
             .call(
@@ -1062,36 +1355,78 @@ impl JmapMcpService {
             )
             .await
             .map_err(map_jmap_err)?;
-        let list = resps
+        Ok(resps
             .into_iter()
             .find(|(n, _, _)| n == "Identity/get")
             .and_then(|(_, p, _)| p.get("list").and_then(Value::as_array).cloned())
-            .unwrap_or_default();
-        // Case-insensitive: addresses are not case-sensitive in practice and
-        // the server echoes whatever case the identity was stored with, so an
-        // exact `==` rejects a correct address on a capitalisation mismatch.
-        let wanted = from.trim().to_ascii_lowercase();
-        list.iter()
-            .find(|i| {
-                i.get("email")
-                    .and_then(Value::as_str)
-                    .is_some_and(|e| e.to_ascii_lowercase() == wanted)
-            })
-            .and_then(|i| i.get("id").and_then(Value::as_str))
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| {
-                let available: Vec<&str> = list
-                    .iter()
-                    .filter_map(|i| i.get("email").and_then(Value::as_str))
-                    .collect();
-                ErrorData::invalid_params(
-                    format!(
-                        "no sending identity matches from-address {from}; available: {}",
-                        available.join(", ")
+            .unwrap_or_default())
+    }
+
+    /// The caller's principal aliases as full addresses. Empty on any failure.
+    async fn principal_aliases(
+        &self,
+        token: &str,
+        session_username: Option<&str>,
+    ) -> Vec<OwnedAddress> {
+        let Some(username) = session_username else {
+            return Vec::new();
+        };
+        // One batch: locate our own principal, read it, and resolve the domain
+        // ids its aliases reference.
+        let Ok(resps) = self
+            .jmap
+            .call(
+                token,
+                &[CAP_CORE, CAP_STALWART],
+                vec![
+                    (
+                        "x:Account/query",
+                        json!({ "filter": { "text": username } }),
+                        "q",
                     ),
-                    None,
-                )
-            })
+                    (
+                        "x:Account/get",
+                        json!({ "#ids": { "resultOf": "q", "name": "x:Account/query", "path": "/ids" } }),
+                        "a",
+                    ),
+                    ("x:Domain/query", json!({}), "dq"),
+                    (
+                        "x:Domain/get",
+                        json!({ "#ids": { "resultOf": "dq", "name": "x:Domain/query", "path": "/ids" } }),
+                        "d",
+                    ),
+                ],
+            )
+            .await
+        else {
+            debug!("principal alias lookup unavailable; using identities only");
+            return Vec::new();
+        };
+
+        let domains = domain_map(&resps);
+        let accounts = method_list(&resps, "x:Account/get");
+        // `text` is a substring filter, so it can return several principals.
+        // Take the one that actually is us.
+        let Some(me) = accounts.iter().find(|a| principal_is(a, username)) else {
+            return Vec::new();
+        };
+        aliases_of(me, &domains)
+    }
+
+    /// Resolve `(from, identityId)` for a submission.
+    ///
+    /// Fetches the mailbox's owned addresses, then delegates the decision to
+    /// [`choose_from_address`], which is pure and unit-tested.
+    async fn resolve_submission_identity(
+        &self,
+        token: &str,
+        account_id: &str,
+        from: Option<&str>,
+        preferred: &[String],
+        session_email: Option<&str>,
+    ) -> Result<(String, String), ErrorData> {
+        let owned = self.owned_addresses(token, account_id, session_email).await;
+        choose_from_address(&owned, from, preferred, session_email)
     }
 
     /// Spawn a fire-and-forget audit note for a write tool, if the caller
@@ -1178,6 +1513,181 @@ impl ServerHandler for JmapMcpService {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn owned(email: &str, identity: Option<&str>) -> OwnedAddress {
+        OwnedAddress {
+            email: email.to_owned(),
+            identity_id: identity.map(ToOwned::to_owned),
+            name: None,
+        }
+    }
+
+    /// The mailbox as it really is: `Identity/get` yields role addresses with
+    /// `team@` first, while the personal address the user wants is an alias
+    /// carrying no identity of its own.
+    fn kampong_mailbox() -> Vec<OwnedAddress> {
+        vec![
+            owned("team@kampong.social", Some("I1")),
+            owned("postmaster@kampong.social", Some("I2")),
+            owned("julian@kampong.social", Some("I3")),
+            owned("julian@lindner.earth", None),
+            owned("julian@lindner.sg", Some("I4")),
+        ]
+    }
+
+    /// The regression: no explicit `from`, parent addressed to the signed-in
+    /// user, must not resolve to the shared `team@` that sorts first.
+    #[test]
+    fn never_picks_the_first_listed_address() {
+        let (from, id) = choose_from_address(
+            &kampong_mailbox(),
+            None,
+            &["julian@kampong.social".to_owned()],
+            Some("julian@kampong.social"),
+        )
+        .unwrap();
+        assert_eq!(from, "julian@kampong.social");
+        assert_eq!(id, "I3");
+    }
+
+    /// An alias with no Identity object is sendable: `From` carries the alias
+    /// and submission borrows the caller's own identity.
+    #[test]
+    fn alias_without_identity_is_sendable() {
+        let (from, id) = choose_from_address(
+            &kampong_mailbox(),
+            Some("julian@lindner.earth"),
+            &[],
+            Some("julian@kampong.social"),
+        )
+        .unwrap();
+        assert_eq!(from, "julian@lindner.earth");
+        assert_eq!(id, "I3", "should borrow the session user's identity");
+    }
+
+    /// Case-insensitive, and whitespace-tolerant.
+    #[test]
+    fn alias_match_is_case_insensitive() {
+        let (from, _) = choose_from_address(
+            &kampong_mailbox(),
+            Some("  Julian@Lindner.Earth "),
+            &[],
+            Some("julian@kampong.social"),
+        )
+        .unwrap();
+        assert_eq!(from, "julian@lindner.earth");
+    }
+
+    /// Role addresses are refused as a personal From even when asked for
+    /// explicitly, and even though they do have Identity objects.
+    #[test]
+    fn role_addresses_are_refused() {
+        for role in ["team@kampong.social", "postmaster@kampong.social"] {
+            let err = choose_from_address(
+                &kampong_mailbox(),
+                Some(role),
+                &[],
+                Some("julian@kampong.social"),
+            )
+            .unwrap_err();
+            let m = err.message.to_string();
+            assert!(m.contains("role address"), "{m}");
+            // The suggestion list must not offer another role address.
+            assert!(!m.contains("team@kampong.social, postmaster"), "{m}");
+        }
+    }
+
+    /// A role address is never selected implicitly either.
+    #[test]
+    fn role_address_is_not_chosen_implicitly() {
+        let err = choose_from_address(
+            &kampong_mailbox(),
+            None,
+            &["team@kampong.social".to_owned()],
+            None,
+        )
+        .unwrap_err();
+        assert!(err.message.to_string().contains("pass `from` explicitly"));
+    }
+
+    /// An address the mailbox does not own is refused, with the options named.
+    #[test]
+    fn unowned_address_is_refused() {
+        let err = choose_from_address(
+            &kampong_mailbox(),
+            Some("someone@elsewhere.test"),
+            &[],
+            Some("julian@kampong.social"),
+        )
+        .unwrap_err();
+        let m = err.message.to_string();
+        assert!(m.contains("not an address on this mailbox"), "{m}");
+        assert!(m.contains("julian@lindner.earth"), "{m}");
+    }
+
+    /// Role addresses are excluded from the suggestion list.
+    #[test]
+    fn sendable_list_omits_role_addresses() {
+        let l = sendable_list(&kampong_mailbox());
+        assert!(l.contains("julian@lindner.earth"));
+        assert!(!l.contains("team@"), "{l}");
+        assert!(!l.contains("postmaster@"), "{l}");
+    }
+
+    #[test]
+    fn role_address_detection() {
+        for r in [
+            "team@kampong.social",
+            "postmaster@lindner.earth",
+            "ABUSE@kampong.social",
+            "no-reply@x.test",
+            "noreply@x.test",
+        ] {
+            assert!(is_role_address(r), "{r} should be a role address");
+        }
+        for p in [
+            "julian@lindner.earth",
+            "julian.japan@lindner.earth",
+            "nathalie@lindner.earth",
+        ] {
+            assert!(!is_role_address(p), "{p} should not be a role address");
+        }
+    }
+
+    /// Aliases are stored as `{name, domainId}`; expansion needs the domain
+    /// map, and disabled aliases are dropped.
+    #[test]
+    fn aliases_expand_against_the_domain_map() {
+        let doms: HashMap<String, String> =
+            std::iter::once(("k".to_owned(), "lindner.earth".to_owned())).collect();
+        let account = json!({ "aliases": {
+            "0": { "name": "julian", "domainId": "k", "enabled": true, "description": "julian local" },
+            "1": { "name": "old",    "domainId": "k", "enabled": false },
+            "2": { "name": "orphan", "domainId": "zz", "enabled": true }
+        }});
+        let out = aliases_of(&account, &doms);
+        assert_eq!(
+            out.len(),
+            1,
+            "disabled and unresolvable aliases are dropped"
+        );
+        assert_eq!(out[0].email, "julian@lindner.earth");
+        assert!(out[0].identity_id.is_none());
+    }
+
+    /// The principal is matched on full address or bare local-part.
+    #[test]
+    fn principal_matching() {
+        let a = json!({ "name": "julian", "email": "julian@kampong.social" });
+        assert!(principal_is(&a, "julian@kampong.social"));
+        assert!(principal_is(&a, "julian"));
+        assert!(!principal_is(&a, "nathalie@kampong.social"));
+    }
+
+    #[test]
+    fn empty_mailbox_is_an_error() {
+        assert!(choose_from_address(&[], None, &[], Some("me@x.test")).is_err());
+    }
 
     #[test]
     fn default_limit_sensible() {
