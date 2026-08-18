@@ -52,7 +52,7 @@ pub struct ProtectedResourceMetadata {
 ///
 /// RFC 9728 §3.3 and the MCP authorization spec require `resource` to match
 /// the URL the client actually connects to. claude.ai tolerates the bare
-/// origin; stricter clients (Grok Bot, LangDock) reject a token whose
+/// origin; stricter clients (Grok Bot, `LangDock`) reject a token whose
 /// advertised resource is the origin when they connected to `{origin}/mcp`.
 ///
 /// `cfg.resource_url` is always the bare origin: it is the JWT audience Logto

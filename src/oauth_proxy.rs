@@ -121,10 +121,8 @@ fn parse_pairs(q: &str) -> Vec<(String, String)> {
 /// clients send that path too. Logto's registered API resource (and the
 /// JWT `aud` we validate) remains the origin, so strip a trailing `/mcp`.
 fn normalize_resource(v: &mut String) {
-    let mut s = v.trim_end_matches('/').to_owned();
-    if let Some(stripped) = s.strip_suffix("/mcp") {
-        s = stripped.to_owned();
-    }
+    let trimmed = v.trim_end_matches('/');
+    let s = trimmed.strip_suffix("/mcp").unwrap_or(trimmed).to_owned();
     if s != *v {
         *v = s;
     }
