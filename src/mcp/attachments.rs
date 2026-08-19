@@ -17,21 +17,31 @@ use futures::StreamExt as _;
 /// must be re-validated against the SSRF denylist before following — and
 /// for the attachment tools we conservatively refuse to follow redirects
 /// at all, requiring the caller to pass the final URL.
-fn fetch_client() -> Result<reqwest::Client, ErrorData> {
-    reqwest::Client::builder()
+fn fetch_client(url: &crate::url_safety::ValidatedHttpsUrl) -> Result<reqwest::Client, ErrorData> {
+    let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("jmap-mcp/", env!("CARGO_PKG_VERSION")))
+        // A configured HTTP(S) proxy would resolve the hostname itself and
+        // bypass the validated address pinning below.
+        .no_proxy()
+        .user_agent(concat!("jmap-mcp/", env!("CARGO_PKG_VERSION")));
+    if url.host_is_domain() {
+        builder = builder.resolve_to_addrs(url.host(), url.resolved_addrs());
+    }
+    builder
         .build()
         .map_err(|e| ErrorData::internal_error(format!("build http client: {e}"), None))
 }
 
 /// Fetch `url` (already SSRF-validated) and return its bytes + content-type,
 /// capping the streamed body at `max_bytes`.
-async fn fetch_capped(url: &str, max_bytes: usize) -> Result<(Vec<u8>, String), ErrorData> {
-    let client = fetch_client()?;
+async fn fetch_capped(
+    url: &crate::url_safety::ValidatedHttpsUrl,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, String), ErrorData> {
+    let client = fetch_client(url)?;
     let resp = client
-        .get(url)
+        .get(url.as_str())
         .send()
         .await
         .map_err(|e| ErrorData::invalid_params(format!("failed to fetch {url}: {e}"), None))?;
@@ -96,6 +106,8 @@ pub struct DownloadAttachmentResult {
     pub size_bytes: u64,
     /// Standard base64-encoded attachment bytes.
     pub body_base64: String,
+    pub untrusted_content: bool,
+    pub suspicious: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -214,7 +226,9 @@ impl JmapMcpService {
 
             let content_type = str_field(attachment, "type")
                 .unwrap_or_else(|| "application/octet-stream".to_owned());
-            let filename = str_field(attachment, "name").unwrap_or_default();
+            let raw_filename = str_field(attachment, "name").unwrap_or_default();
+            let filename = crate::content_sandbox::sanitize_external_text(&raw_filename);
+            let suspicious = crate::content_sandbox::external_text_is_suspicious(&raw_filename);
             let declared_size = attachment.get("size").and_then(Value::as_u64);
 
             // Reject up front if the declared size already exceeds the cap.
@@ -236,7 +250,7 @@ impl JmapMcpService {
                     &token.0,
                     &params.attachment_id,
                     &content_type,
-                    &filename,
+                    &raw_filename,
                     self.download_max_bytes,
                 )
                 .await
@@ -249,6 +263,8 @@ impl JmapMcpService {
                 content_type,
                 size_bytes,
                 body_base64,
+                untrusted_content: true,
+                suspicious,
             })
         }
         .instrument(span.clone())
@@ -291,11 +307,11 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            crate::url_safety::validate_https_url(&params.url)
+            let validated_url = crate::url_safety::validate_https_url(&params.url)
                 .await
                 .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
 
-            let (bytes, content_type) = fetch_capped(&params.url, self.upload_max_bytes).await?;
+            let (bytes, content_type) = fetch_capped(&validated_url, self.upload_max_bytes).await?;
             let uploaded = self
                 .jmap
                 .upload_blob(&token.0, bytes, &content_type)
@@ -352,7 +368,7 @@ impl JmapMcpService {
                 return Err(ErrorData::invalid_params("`to` must not be empty", None));
             }
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            crate::url_safety::validate_https_url(&params.attachment_url)
+            let validated_url = crate::url_safety::validate_https_url(&params.attachment_url)
                 .await
                 .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
 
@@ -362,13 +378,19 @@ impl JmapMcpService {
                 .ok_or_else(|| ErrorData::internal_error("no Drafts mailbox found", None))?;
             let sent = Self::role_mailbox(&mailboxes, "sent");
 
-            let identity_id = self
-                .identity_id_for(&token.0, &account_id, &params.from)
+            let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
+            let (from_addr, identity_id) = self
+                .resolve_submission_identity(
+                    &token.0,
+                    &account_id,
+                    Some(&params.from),
+                    &[],
+                    session_email.as_deref(),
+                )
                 .await?;
 
             // Fetch + upload the attachment before composing the draft.
-            let (bytes, content_type) =
-                fetch_capped(&params.attachment_url, self.upload_max_bytes).await?;
+            let (bytes, content_type) = fetch_capped(&validated_url, self.upload_max_bytes).await?;
             let uploaded = self
                 .jmap
                 .upload_blob(&token.0, bytes, &content_type)
@@ -381,7 +403,7 @@ impl JmapMcpService {
             let email_obj = json!({
                 "mailboxIds": { drafts.clone(): true },
                 "keywords": { "$draft": true, "$seen": true },
-                "from": [ { "email": params.from } ],
+                "from": [ { "email": from_addr } ],
                 "to": to_addrs,
                 "subject": params.subject,
                 "bodyValues": { "b": { "value": params.body, "isTruncated": false } },

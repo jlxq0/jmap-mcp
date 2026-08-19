@@ -130,7 +130,10 @@ mod tests {
             &allowed,
             "cursor://anysphere.cursor-mcp/oauth/callback/extra"
         ));
-        assert!(!is_allowed_redirect_uri(&allowed, "evil://mcp/oauth/callback"));
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "evil://mcp/oauth/callback"
+        ));
     }
 
     /// RFC 8252 §7.3 — loopback HTTP is allowed; any other cleartext host is
@@ -159,8 +162,11 @@ mod tests {
                    https://www.cursor.com/agents/mcp/oauth/callback,\
                    cursor://anysphere.cursor-mcp/oauth/callback,\
                    grokbot://mcp/oauth/callback,\
-                   http://localhost:8787/callback";
+                   http://localhost:8787/callback,\
+                   claude://claude.ai/oauth/callback,\
+                   claude://oauth/callback,\
+                   cowork://oauth/callback";
         let allowed = parse_allowlist(raw, ENV_OAUTH_REDIRECT_URIS).unwrap();
-        assert_eq!(allowed.len(), 6);
+        assert_eq!(allowed.len(), 9);
     }
 }

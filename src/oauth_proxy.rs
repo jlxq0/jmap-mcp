@@ -20,7 +20,7 @@
 //!   allowlisted `redirect_uri` to our callback (Logto bound the code to it). PKCE verifier
 //!   and the returned tokens pass through untouched — we mint nothing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,10 +35,13 @@ use url::Url;
 use crate::oauth_redirect::is_allowed_redirect_uri;
 
 /// How long a pending authorization (client redirect/state mapping) lives.
-#[allow(clippy::duration_suboptimal_units)] // `from_secs` is clearer than mins here
+#[allow(unknown_lints, clippy::duration_suboptimal_units)] // `from_secs` is clearer than mins here
 const PENDING_TTL: Duration = Duration::from_secs(600);
-/// Soft cap on concurrent pending authorizations; sweep on overflow.
+/// Hard cap on concurrent pending authorizations.
 const PENDING_CAP: usize = 2048;
+/// OAuth state is opaque to us, but retaining arbitrarily large values makes
+/// the public authorization endpoint an avoidable memory amplifier.
+const MAX_CLIENT_STATE_BYTES: usize = 4096;
 
 #[derive(Clone)]
 pub struct OAuthProxyState {
@@ -52,13 +55,19 @@ struct Inner {
     callback_url: String,
     http: reqwest::Client,
     allowed_redirect_uris: Vec<String>,
-    pending: Mutex<HashMap<String, Pending>>,
+    pending: Mutex<PendingAuthorizations>,
 }
 
 struct Pending {
     client_redirect_uri: String,
     client_state: Option<String>,
     created: Instant,
+}
+
+#[derive(Default)]
+struct PendingAuthorizations {
+    by_state: HashMap<String, Pending>,
+    by_age: BTreeSet<(Instant, String)>,
 }
 
 impl OAuthProxyState {
@@ -74,27 +83,38 @@ impl OAuthProxyState {
                 callback_url: format!("{}/oauth/callback", resource_url.trim_end_matches('/')),
                 http,
                 allowed_redirect_uris,
-                pending: Mutex::new(HashMap::new()),
+                pending: Mutex::new(PendingAuthorizations::default()),
             }),
         }
     }
 
     fn insert(&self, state: String, pending: Pending) {
         if let Ok(mut g) = self.inner.pending.lock() {
-            if g.len() >= PENDING_CAP {
-                let now = Instant::now();
-                g.retain(|_, p| now.duration_since(p.created) < PENDING_TTL);
+            let now = Instant::now();
+            while let Some((created, oldest_state)) = g.by_age.first().cloned() {
+                let expired = now.saturating_duration_since(created) >= PENDING_TTL;
+                if !expired && g.by_state.len() < PENDING_CAP {
+                    break;
+                }
+                g.by_age.remove(&(created, oldest_state.clone()));
+                g.by_state.remove(&oldest_state);
             }
-            g.insert(state, pending);
+            if let Some(replaced) = g.by_state.remove(&state) {
+                g.by_age.remove(&(replaced.created, state.clone()));
+            }
+            g.by_age.insert((pending.created, state.clone()));
+            g.by_state.insert(state, pending);
         }
     }
 
     fn take(&self, state: &str) -> Option<Pending> {
         let p = {
             let mut g = self.inner.pending.lock().ok()?;
-            g.remove(state)?
+            let p = g.by_state.remove(state)?;
+            g.by_age.remove(&(p.created, state.to_owned()));
+            p
         };
-        if Instant::now().duration_since(p.created) >= PENDING_TTL {
+        if Instant::now().saturating_duration_since(p.created) >= PENDING_TTL {
             return None;
         }
         Some(p)
@@ -121,10 +141,8 @@ fn parse_pairs(q: &str) -> Vec<(String, String)> {
 /// clients send that path too. Logto's registered API resource (and the
 /// JWT `aud` we validate) remains the origin, so strip a trailing `/mcp`.
 fn normalize_resource(v: &mut String) {
-    let mut s = v.trim_end_matches('/').to_owned();
-    if let Some(stripped) = s.strip_suffix("/mcp") {
-        s = stripped.to_owned();
-    }
+    let trimmed = v.trim_end_matches('/');
+    let s = trimmed.strip_suffix("/mcp").unwrap_or(trimmed).to_owned();
     if s != *v {
         *v = s;
     }
@@ -150,6 +168,12 @@ pub async fn authorize(State(st): State<OAuthProxyState>, RawQuery(q): RawQuery)
         .iter()
         .find(|(k, _)| k == "state")
         .map(|(_, v)| v.clone());
+    if client_state
+        .as_ref()
+        .is_some_and(|state| state.len() > MAX_CLIENT_STATE_BYTES)
+    {
+        return (StatusCode::BAD_REQUEST, "state is too large\n").into_response();
+    }
 
     let proxy_state = random_state();
     st.insert(
@@ -312,6 +336,50 @@ mod tests {
         assert_eq!(p.client_state.as_deref(), Some("xyz"));
         // consumed
         assert!(st.take("abc").is_none());
+    }
+
+    #[test]
+    fn pending_authorizations_are_hard_capped() {
+        let st = OAuthProxyState::new(
+            "https://l.test/oidc",
+            "https://r.test",
+            vec!["https://claude.ai/cb".to_owned()],
+        );
+        for i in 0..=PENDING_CAP {
+            st.insert(
+                format!("state-{i}"),
+                Pending {
+                    client_redirect_uri: "https://claude.ai/cb".to_owned(),
+                    client_state: Some(format!("client-{i}")),
+                    created: Instant::now(),
+                },
+            );
+        }
+        let pending = st.inner.pending.lock().unwrap();
+        assert_eq!(pending.by_state.len(), PENDING_CAP);
+        assert_eq!(pending.by_age.len(), PENDING_CAP);
+        assert!(!pending.by_state.contains_key("state-0"));
+        assert!(
+            pending
+                .by_state
+                .contains_key(&format!("state-{PENDING_CAP}"))
+        );
+        drop(pending);
+    }
+
+    #[tokio::test]
+    async fn authorize_rejects_oversized_client_state() {
+        let st = OAuthProxyState::new(
+            "https://login.example.test/oidc",
+            "https://jmap-mcp.example.test",
+            vec!["https://claude.ai/cb".to_owned()],
+        );
+        let query = format!(
+            "redirect_uri=https%3A%2F%2Fclaude.ai%2Fcb&state={}",
+            "a".repeat(MAX_CLIENT_STATE_BYTES + 1)
+        );
+        let response = authorize(State(st), RawQuery(Some(query))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

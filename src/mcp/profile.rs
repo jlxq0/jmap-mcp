@@ -10,6 +10,39 @@ use super::*;
 /// JMAP vacation-response capability URN (RFC 8621 §8).
 const CAP_VACATION: &str = "urn:ietf:params:jmap:vacationresponse";
 
+fn select_profile_identity(list: &[Value], preferred_email: Option<&str>) -> Option<Value> {
+    preferred_email
+        .and_then(|email| {
+            list.iter().find(|identity| {
+                str_field(identity, "email")
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(email))
+            })
+        })
+        .or_else(|| {
+            list.iter().find(|identity| {
+                str_field(identity, "email").is_some_and(|email| !is_role_address(&email))
+            })
+        })
+        .or_else(|| list.first())
+        .cloned()
+}
+
+fn vacation_capability_unsupported(error: &JmapError) -> bool {
+    matches!(
+        error,
+        JmapError::Method { error_type, .. }
+            if error_type == "unknownMethod" || error_type == "unknownCapability"
+    )
+}
+
+fn map_vacation_set_error(error: JmapError) -> ErrorData {
+    if vacation_capability_unsupported(&error) {
+        ErrorData::invalid_params("vacation response not supported", None)
+    } else {
+        map_jmap_err(error)
+    }
+}
+
 // ----- result + parameter types -----
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -49,6 +82,24 @@ pub struct SetVacationResponseResult {
     pub message: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateIdentityParams {
+    /// Address to register as a sending identity, e.g.
+    /// `julian@lindner.earth`. The mail server only accepts an address the
+    /// account actually owns; anything else is refused server-side.
+    pub email: String,
+    /// Display name to show alongside the address.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct CreateIdentityResult {
+    pub identity_id: String,
+    pub email: String,
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct AccountInfoResult {
     pub email: Option<String>,
@@ -77,6 +128,124 @@ pub struct SetAuditMailboxResult {
 
 #[tool_router(router = profile_router, vis = "pub(crate)")]
 impl JmapMcpService {
+    /// Register an additional sending identity (from-address).
+    ///
+    /// Creating an identity does **not** send anything. The server is the
+    /// authority on which addresses the account may send as: `Identity/set`
+    /// rejects an address the account does not own, so this cannot be used to
+    /// register someone else's address.
+    #[tool(
+        description = "Register an additional from-address as a sending identity for this \
+                       account (e.g. a personal address on another of your domains). Sends \
+                       no mail. The server rejects any address this account does not own. \
+                       Use `get_identities` to list what already exists.",
+        annotations(
+            title = "Create sending identity",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn create_identity(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<CreateIdentityParams>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        let started = Instant::now();
+        let user = identity_from_ctx(&ctx)
+            .and_then(|i| i.email)
+            .unwrap_or_default();
+        let span = make_tool_span("create_identity", &user, None);
+        let mut result = async {
+            self.rate_limit_check(&ctx, Category::Write)?;
+            let email = params.email.trim();
+            if !is_plausible_address(email) {
+                return Err(ErrorData::invalid_params(
+                    format!("`email` is not a valid address: {email}"),
+                    None,
+                ));
+            }
+            let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
+            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+
+            let mut identity = json!({ "email": email });
+            if let Some(name) = params
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                identity["name"] = Value::String(name.to_owned());
+            }
+
+            let resps = self
+                .jmap
+                .call(
+                    &token.0,
+                    &[CAP_CORE, CAP_SUBMISSION],
+                    vec![(
+                        "Identity/set",
+                        json!({ "accountId": account_id, "create": { "i": identity } }),
+                        "i",
+                    )],
+                )
+                .await
+                .map_err(map_jmap_err)?;
+
+            let created = resps
+                .iter()
+                .find(|(n, _, _)| n == "Identity/set")
+                .and_then(|(_, p, _)| p.get("created").and_then(|c| c.get("i")).cloned());
+
+            let Some(created) = created else {
+                // `Identity/set` reports refusal in `notCreated`, not as a
+                // method-level error, so a bare 200 is not success. The usual
+                // reason is that the account does not own the address.
+                let reason = resps
+                    .iter()
+                    .find(|(n, _, _)| n == "Identity/set")
+                    .and_then(|(_, p, _)| p.get("notCreated"))
+                    .map_or_else(
+                        || "server created no identity".to_owned(),
+                        std::string::ToString::to_string,
+                    );
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "could not create identity {email}: {reason}. The address must be one \
+                         this account owns — add it as an address/alias on the account first."
+                    ),
+                    None,
+                ));
+            };
+
+            let identity_id = created
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ErrorData::internal_error("Identity/set returned no id", None))?
+                .to_owned();
+
+            structured_result(&CreateIdentityResult {
+                identity_id,
+                email: email.to_owned(),
+                name: params.name.clone(),
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        self.react_to_auth_expiry(&ctx, &mut result).await;
+        self.spawn_audit(&ctx, "create_identity", None, &result);
+        emit_tool_audit(
+            "create_identity",
+            &user,
+            None,
+            started,
+            None,
+            &span,
+            &result,
+        );
+        result
+    }
+
     /// The caller's default sending identity as a profile.
     #[tool(
         description = "Return the user's profile (email + display name) from their default sending identity.",
@@ -95,6 +264,12 @@ impl JmapMcpService {
             self.rate_limit_check(&ctx, Category::Read)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
             let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let session_email = self
+                .jmap
+                .session_for(&token.0)
+                .await
+                .map_err(map_jmap_err)?
+                .username;
             let resps = self
                 .jmap
                 .call(
@@ -108,14 +283,15 @@ impl JmapMcpService {
                 )
                 .await
                 .map_err(map_jmap_err)?;
-            let identity = resps
+            let identities = resps
                 .into_iter()
                 .find(|(n, _, _)| n == "Identity/get")
-                .and_then(|(_, p, _)| {
-                    p.get("list")
-                        .and_then(Value::as_array)
-                        .and_then(|a| a.first().cloned())
-                });
+                .and_then(|(_, p, _)| p.get("list").and_then(Value::as_array).cloned())
+                .unwrap_or_default();
+            let preferred_email = identity_from_ctx(&ctx)
+                .and_then(|identity| identity.email)
+                .or(session_email);
+            let identity = select_profile_identity(&identities, preferred_email.as_deref());
             structured_result(&GetProfileResult {
                 email: identity.as_ref().and_then(|i| str_field(i, "email")),
                 name: identity.as_ref().and_then(|i| str_field(i, "name")),
@@ -152,7 +328,7 @@ impl JmapMcpService {
             self.rate_limit_check(&ctx, Category::Read)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
             let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
-            let resps = self
+            let resps = match self
                 .jmap
                 .call(
                     &token.0,
@@ -163,17 +339,19 @@ impl JmapMcpService {
                         "v",
                     )],
                 )
-                .await;
-            // Capability absent (or any method error) → report unsupported
-            // rather than failing the call.
-            let Ok(resps) = resps else {
-                return structured_result(&VacationResponseResult {
-                    enabled: false,
-                    message: None,
-                    from_date: None,
-                    to_date: None,
-                    supported: false,
-                });
+                .await
+            {
+                Ok(resps) => resps,
+                Err(error) if vacation_capability_unsupported(&error) => {
+                    return structured_result(&VacationResponseResult {
+                        enabled: false,
+                        message: None,
+                        from_date: None,
+                        to_date: None,
+                        supported: false,
+                    });
+                }
+                Err(error) => return Err(map_jmap_err(error)),
             };
             let vacation = resps
                 .into_iter()
@@ -261,16 +439,30 @@ impl JmapMcpService {
                     )],
                 )
                 .await
-                .map_err(|_| ErrorData::invalid_params("vacation response not supported", None))?;
-            let updated = resps
+                .map_err(map_vacation_set_error)?;
+            let response = resps
                 .iter()
                 .find(|(n, _, _)| n == "VacationResponse/set")
-                .and_then(|(_, p, _)| p.get("updated"))
+                .map(|(_, payload, _)| payload)
+                .ok_or_else(|| {
+                    ErrorData::internal_error("missing VacationResponse/set response", None)
+                })?;
+            let updated = response
+                .get("updated")
                 .and_then(Value::as_object)
                 .is_some_and(|o| o.contains_key("singleton"));
             if !updated {
-                return Err(ErrorData::invalid_params(
-                    "vacation response not supported",
+                if let Some(failure) = response.get("notUpdated").and_then(|v| v.get("singleton")) {
+                    let reason = failure
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .or_else(|| failure.get("type").and_then(Value::as_str))
+                        .unwrap_or("vacation response update was rejected")
+                        .to_owned();
+                    return Err(ErrorData::invalid_params(reason, None));
+                }
+                return Err(ErrorData::internal_error(
+                    "vacation response was neither updated nor rejected",
                     None,
                 ));
             }
@@ -480,10 +672,78 @@ fn host_of(url: &str) -> Option<String> {
     Some(format!("{scheme}://{authority}"))
 }
 
+/// Cheap sanity check on an address before handing it to the server.
+///
+/// Deliberately permissive — the mail server is the authority on both syntax
+/// and, crucially, on whether the account may send as this address. This only
+/// catches obvious junk (empty, no `@`, whitespace, no dot in the domain) so
+/// the caller gets a clear message instead of an opaque server rejection.
+fn is_plausible_address(email: &str) -> bool {
+    if email.is_empty() || email.len() > 320 || email.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Some((local, domain)) = email.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !email.contains("@@")
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_identity_prefers_signed_in_address_over_list_order() {
+        let identities = vec![
+            json!({"email": "team@kampong.social", "name": "Team"}),
+            json!({"email": "julian@kampong.social", "name": "Julian"}),
+        ];
+        let selected = select_profile_identity(&identities, Some("julian@kampong.social")).unwrap();
+        assert_eq!(
+            str_field(&selected, "email").as_deref(),
+            Some("julian@kampong.social")
+        );
+    }
+
+    #[test]
+    fn vacation_transport_and_auth_errors_are_not_reported_as_unsupported() {
+        assert!(vacation_capability_unsupported(&JmapError::Method {
+            error_type: "unknownMethod".to_owned(),
+            description: None,
+        }));
+        assert!(!vacation_capability_unsupported(&JmapError::Unauthorized));
+        let mapped = map_vacation_set_error(JmapError::Unauthorized);
+        assert_eq!(mapped.code.0, audit::AUTH_EXPIRED_CODE);
+    }
+
+    #[test]
+    fn plausible_addresses_accepted() {
+        assert!(is_plausible_address("julian@lindner.earth"));
+        assert!(is_plausible_address("julian@kampong.social"));
+    }
+
+    #[test]
+    fn implausible_addresses_rejected() {
+        for bad in [
+            "",
+            "julian",
+            "@lindner.earth",
+            "julian@",
+            "julian@localdomain",
+            "julian@.earth",
+            "julian@lindner.",
+            "julian doe@lindner.earth",
+            "a@@b.test",
+        ] {
+            assert!(!is_plausible_address(bad), "should reject {bad:?}");
+        }
+    }
 
     #[test]
     fn host_of_strips_path() {

@@ -1,5 +1,6 @@
 //! Axum middleware: extract the `Authorization: Bearer <token>` header,
-//! validate it against Logto (JWKS + RS256), and attach the resulting
+//! validate it against Logto (JWKS plus an asymmetric-algorithm allowlist),
+//! and attach the resulting
 //! `AuthenticatedIdentity` + raw `AccessToken` to the request extensions so
 //! downstream handlers (and the rmcp tool layer) can read them.
 
@@ -17,7 +18,7 @@ use crate::audit::{self, outcome};
 use crate::config::Config;
 use crate::last_used::{self, LastUsedTracker};
 use crate::logto_oidc::LogtoValidationClient;
-use crate::oauth_metadata::www_authenticate_header;
+use crate::oauth_metadata::{www_authenticate_header, www_authenticate_invalid_token};
 
 /// Newtype around the raw OAuth access token, stashed on request extensions
 /// by `bearer_auth`. The Logto JWT doubles as the JMAP credential: tools
@@ -47,7 +48,9 @@ pub async fn bearer_auth(
     next: Next,
 ) -> Response {
     let Some(token) = extract_bearer(request.headers().get(header::AUTHORIZATION)) else {
-        return unauthorized(&state.config.resource_url);
+        // No credential offered — a bare challenge, no `error` (RFC 6750 §3:
+        // `error` is only for requests that actually presented one).
+        return unauthorized(&www_authenticate_header(&state.config.resource_url));
     };
 
     let started = std::time::Instant::now();
@@ -85,7 +88,9 @@ pub async fn bearer_auth(
         Ok(None) => {
             debug!("token rejected by Logto validation");
             audit::introspect(&token_hash, outcome::INACTIVE, started, None);
-            unauthorized(&state.config.resource_url)
+            // A token WAS presented and refused — say so, so the client
+            // re-runs OAuth instead of showing a wedged connector.
+            unauthorized(&www_authenticate_invalid_token(&state.config.resource_url))
         }
         Err(e) => {
             warn!(error = %e, "Logto JWKS validation failure");
@@ -111,10 +116,9 @@ fn extract_bearer(header: Option<&HeaderValue>) -> Option<String> {
     Some(token.to_owned())
 }
 
-fn unauthorized(resource_url: &str) -> Response {
-    let header_value = www_authenticate_header(resource_url);
+fn unauthorized(challenge: &str) -> Response {
     let value =
-        HeaderValue::from_str(&header_value).unwrap_or_else(|_| HeaderValue::from_static("Bearer"));
+        HeaderValue::from_str(challenge).unwrap_or_else(|_| HeaderValue::from_static("Bearer"));
     let mut response = (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response();
     response
         .headers_mut()
@@ -167,10 +171,37 @@ mod tests {
 
     #[tokio::test]
     async fn unauthorized_has_www_authenticate() {
-        let r = unauthorized("https://jmap-mcp.example.test");
+        let r = unauthorized(&www_authenticate_header("https://jmap-mcp.example.test"));
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
         let h = r.headers().get(header::WWW_AUTHENTICATE).unwrap();
         assert!(h.to_str().unwrap().contains("resource_metadata="));
+        let _ = to_bytes(r.into_body(), 1024).await.unwrap();
+    }
+
+    /// No credential offered → bare challenge, no `error` (RFC 6750 §3).
+    #[tokio::test]
+    async fn missing_token_challenge_has_no_error_param() {
+        let r = unauthorized(&www_authenticate_header("https://jmap-mcp.example.test"));
+        let h = r.headers().get(header::WWW_AUTHENTICATE).unwrap();
+        assert!(!h.to_str().unwrap().contains("error="));
+        let _ = to_bytes(r.into_body(), 1024).await.unwrap();
+    }
+
+    /// A rejected credential → `error="invalid_token"`, which is what makes
+    /// strict clients re-run OAuth rather than wedge.
+    #[tokio::test]
+    async fn rejected_token_challenge_signals_invalid_token() {
+        let r = unauthorized(&www_authenticate_invalid_token(
+            "https://jmap-mcp.example.test",
+        ));
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        let h = r.headers().get(header::WWW_AUTHENTICATE).unwrap();
+        let v = h.to_str().unwrap();
+        assert!(v.contains(r#"error="invalid_token""#));
+        // The contracted resource-metadata URL is unchanged by the addition.
+        assert!(v.contains(
+            r#"resource_metadata="https://jmap-mcp.example.test/.well-known/oauth-protected-resource/mcp""#
+        ));
         let _ = to_bytes(r.into_body(), 1024).await.unwrap();
     }
 }

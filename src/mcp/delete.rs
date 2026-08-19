@@ -5,6 +5,27 @@
 
 use super::*;
 
+fn account_empty_batch(
+    total: u32,
+    queried: usize,
+    destroyed: usize,
+) -> Result<Option<u32>, ErrorData> {
+    if queried == 0 {
+        return Ok(None);
+    }
+    if destroyed != queried {
+        return Err(ErrorData::internal_error(
+            format!(
+                "mailbox emptying stopped after a partial batch: queried {queried}, destroyed {destroyed}"
+            ),
+            None,
+        ));
+    }
+    Ok(Some(total.saturating_add(
+        u32::try_from(destroyed).unwrap_or(u32::MAX),
+    )))
+}
+
 // ----- delete_email -----
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -270,51 +291,81 @@ impl JmapMcpService {
 }
 
 impl JmapMcpService {
-    /// Permanently destroy every email in `mailbox_id` in one round-trip:
-    /// `Email/query` (filtered to the mailbox) feeds `Email/set`'s `#destroy`
-    /// back-reference. Returns the count of destroyed ids.
+    /// Permanently destroy every email in `mailbox_id` in bounded batches.
+    /// Returns only after a follow-up query confirms the mailbox is empty.
     async fn empty_mailbox(
         &self,
         token: &str,
         account_id: &str,
         mailbox_id: &str,
     ) -> Result<u32, ErrorData> {
-        let resps = self
-            .jmap
-            .call(
-                token,
-                &[CAP_CORE, CAP_MAIL],
-                vec![
-                    (
-                        "Email/query",
-                        json!({
-                            "accountId": account_id,
-                            "filter": { "inMailbox": mailbox_id },
-                            "limit": 1000
-                        }),
-                        "q",
-                    ),
-                    (
-                        "Email/set",
-                        json!({
-                            "accountId": account_id,
-                            "#destroy": {
-                                "resultOf": "q",
-                                "name": "Email/query",
-                                "path": "/ids"
-                            }
-                        }),
-                        "e",
-                    ),
-                ],
-            )
-            .await
-            .map_err(map_jmap_err)?;
-        let destroyed = resps
-            .iter()
-            .find(|(n, _, _)| n == "Email/set")
-            .and_then(|(_, p, _)| p.get("destroyed").and_then(Value::as_array))
-            .map_or(0, Vec::len);
-        Ok(u32::try_from(destroyed).unwrap_or(u32::MAX))
+        let mut total = 0_u32;
+        loop {
+            let resps = self
+                .jmap
+                .call(
+                    token,
+                    &[CAP_CORE, CAP_MAIL],
+                    vec![
+                        (
+                            "Email/query",
+                            json!({
+                                "accountId": account_id,
+                                "filter": { "inMailbox": mailbox_id },
+                                "limit": 1000
+                            }),
+                            "q",
+                        ),
+                        (
+                            "Email/set",
+                            json!({
+                                "accountId": account_id,
+                                "#destroy": {
+                                    "resultOf": "q",
+                                    "name": "Email/query",
+                                    "path": "/ids"
+                                }
+                            }),
+                            "e",
+                        ),
+                    ],
+                )
+                .await
+                .map_err(map_jmap_err)?;
+            let queried = resps
+                .iter()
+                .find(|(name, _, _)| name == "Email/query")
+                .and_then(|(_, payload, _)| payload.get("ids").and_then(Value::as_array))
+                .map_or(0, Vec::len);
+            let destroyed = resps
+                .iter()
+                .find(|(name, _, _)| name == "Email/set")
+                .and_then(|(_, payload, _)| payload.get("destroyed").and_then(Value::as_array))
+                .map_or(0, Vec::len);
+            let Some(next_total) = account_empty_batch(total, queried, destroyed)? else {
+                return Ok(total);
+            };
+            total = next_total;
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_mailbox_continues_past_the_first_thousand() {
+        let total = account_empty_batch(0, 1000, 1000).unwrap().unwrap();
+        let total = account_empty_batch(total, 500, 500).unwrap().unwrap();
+        assert_eq!(total, 1500);
+        assert!(account_empty_batch(total, 0, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_mailbox_refuses_to_claim_success_after_partial_batch() {
+        let error = account_empty_batch(0, 1000, 999).unwrap_err();
+        assert!(error.message.contains("partial batch"));
     }
 }

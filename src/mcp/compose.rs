@@ -54,6 +54,13 @@ pub struct ReplyEmailParams {
     pub reply_to_all: bool,
     /// Plain-text reply body.
     pub body: String,
+    /// From address to send as. Must be one of the caller's identities.
+    /// Omit only when the correct identity is unambiguous: the address the
+    /// original message was actually addressed to, otherwise the signed-in
+    /// user's own address. If neither applies the call fails and asks for an
+    /// explicit value rather than guessing.
+    #[serde(default)]
+    pub from: Option<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -72,6 +79,11 @@ pub struct ForwardEmailParams {
     /// Optional note to prepend above the quoted original.
     #[serde(default)]
     pub message: Option<String>,
+    /// From address to send as. Must be one of the caller's identities.
+    /// Omit only to send as the signed-in user's own address; the call fails
+    /// asking for an explicit value rather than guessing.
+    #[serde(default)]
+    pub from: Option<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -157,7 +169,16 @@ impl JmapMcpService {
             let drafts = Self::role_mailbox(&mailboxes, "drafts")
                 .ok_or_else(|| ErrorData::internal_error("no Drafts mailbox found", None))?;
             let sent = Self::role_mailbox(&mailboxes, "sent");
-            let identity_id = self.identity_id_for(&token.0, &account_id, &params.from).await?;
+            let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
+            let (from_addr, identity_id) = self
+                .resolve_submission_identity(
+                    &token.0,
+                    &account_id,
+                    Some(&params.from),
+                    &[],
+                    session_email.as_deref(),
+                )
+                .await?;
 
             // Decode + upload each attachment, collecting blob ids.
             let mut attachment_ids = Vec::with_capacity(params.attachments.len());
@@ -191,7 +212,7 @@ impl JmapMcpService {
             let mut email_obj = json!({
                 "mailboxIds": { drafts.clone(): true },
                 "keywords": { "$draft": true, "$seen": true },
-                "from": [ { "email": params.from } ],
+                "from": [ { "email": from_addr } ],
                 "to": to_addrs,
                 "subject": params.subject,
                 "bodyValues": { "b": { "value": params.body_text, "isTruncated": false } },
@@ -278,9 +299,8 @@ impl JmapMcpService {
         Parameters(params): Parameters<ReplyEmailParams>,
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         let started = Instant::now();
-        let user = identity_from_ctx(&ctx)
-            .and_then(|i| i.email)
-            .unwrap_or_default();
+        let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
+        let user = session_email.clone().unwrap_or_default();
         let eid = params.email_id.clone();
         let span = make_tool_span("reply_email", &user, Some(&eid));
         let mut result = async {
@@ -315,14 +335,23 @@ impl JmapMcpService {
                 ));
             }
 
-            // From-address: the caller identity that was an original recipient,
-            // else the default (first) identity.
-            let identities = self.list_identities(&token.0, &account_id).await?;
-            let recipient_addrs = recipient_addr_set(&parent, params.reply_to_all);
-            let (from_addr, identity_id) = pick_reply_identity(&identities, &recipient_addrs)
-                .ok_or_else(|| {
-                    ErrorData::invalid_params("no usable sending identity for reply", None)
-                })?;
+            // From-address: explicit `from` wins; else the identity this
+            // message was actually addressed to; else the signed-in user.
+            // Never the account's first identity — that is the shared
+            // `team@` role address here.
+            // Prefer an explicit `from`; else the address this message was
+            // actually delivered to; else the signed-in user. Aliases are
+            // accepted; shared role addresses are refused.
+            let addressed_to = parent_addressed_identities(&parent);
+            let (from_addr, identity_id) = self
+                .resolve_submission_identity(
+                    &token.0,
+                    &account_id,
+                    params.from.as_deref(),
+                    &addressed_to,
+                    session_email.as_deref(),
+                )
+                .await?;
 
             let parent_subject = str_field(&parent, "subject").unwrap_or_default();
             let subject = if parent_subject.to_ascii_lowercase().starts_with("re:") {
@@ -434,9 +463,8 @@ impl JmapMcpService {
         Parameters(params): Parameters<ForwardEmailParams>,
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         let started = Instant::now();
-        let user = identity_from_ctx(&ctx)
-            .and_then(|i| i.email)
-            .unwrap_or_default();
+        let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
+        let user = session_email.clone().unwrap_or_default();
         let eid = params.email_id.clone();
         let span = make_tool_span("forward_email", &user, Some(&eid));
         let mut result = async {
@@ -461,10 +489,17 @@ impl JmapMcpService {
                 )
                 .await?;
 
-            // From-address: the default (first) identity.
-            let identities = self.list_identities(&token.0, &account_id).await?;
-            let (from_addr, identity_id) = first_identity(&identities)
-                .ok_or_else(|| ErrorData::invalid_params("no sending identity available", None))?;
+            // From-address: explicit `from`, else the signed-in user. Never
+            // the account's first identity (a shared `team@` role address).
+            let (from_addr, identity_id) = self
+                .resolve_submission_identity(
+                    &token.0,
+                    &account_id,
+                    params.from.as_deref(),
+                    &[],
+                    session_email.as_deref(),
+                )
+                .await?;
 
             let parent_subject = str_field(&parent, "subject").unwrap_or_default();
             let subject = if parent_subject.to_ascii_lowercase().starts_with("fwd:") {
@@ -660,7 +695,20 @@ impl JmapMcpService {
 
             let mut patch = serde_json::Map::new();
             if let Some(from) = &params.from {
-                patch.insert("from".to_owned(), json!([ { "email": from } ]));
+                // Validate against the caller's identities before patching:
+                // an unowned From here would otherwise sit in the draft and
+                // only fail later at submission, or worse, go out as-is.
+                let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
+                let (from_addr, _) = self
+                    .resolve_submission_identity(
+                        &token.0,
+                        &account_id,
+                        Some(from),
+                        &[],
+                        session_email.as_deref(),
+                    )
+                    .await?;
+                patch.insert("from".to_owned(), json!([ { "email": from_addr } ]));
             }
             if let Some(to) = &params.to {
                 let to_addrs: Vec<Value> = to.iter().map(|e| json!({ "email": e })).collect();
@@ -786,32 +834,6 @@ impl JmapMcpService {
             })
             .ok_or_else(|| ErrorData::invalid_params("email_id: not found", None))
     }
-
-    /// Fetch the caller's sendable identities as raw JMAP objects.
-    async fn list_identities(
-        &self,
-        token: &str,
-        account_id: &str,
-    ) -> Result<Vec<Value>, ErrorData> {
-        let resps = self
-            .jmap
-            .call(
-                token,
-                &[CAP_CORE, CAP_SUBMISSION],
-                vec![(
-                    "Identity/get",
-                    json!({ "accountId": account_id, "ids": Value::Null }),
-                    "i",
-                )],
-            )
-            .await
-            .map_err(map_jmap_err)?;
-        Ok(resps
-            .into_iter()
-            .find(|(n, _, _)| n == "Identity/get")
-            .and_then(|(_, p, _)| p.get("list").and_then(Value::as_array).cloned())
-            .unwrap_or_default())
-    }
 }
 
 // ----- module-level helpers -----
@@ -855,16 +877,19 @@ fn raw_addr_objs(email: &Value, field: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// Collect the set of recipient email addresses (lower-cased) on a parent
-/// email: From always; To+CC when replying to all.
-fn recipient_addr_set(parent: &Value, reply_to_all: bool) -> Vec<String> {
-    let mut fields: Vec<&str> = vec!["from"];
-    if reply_to_all {
-        fields.push("to");
-        fields.push("cc");
-    }
+/// Addresses the parent message was **delivered to** (To, then CC).
+///
+/// These are the candidates for "reply from the address they wrote to", so a
+/// message sent to a personal address is answered from that address rather
+/// than from some other identity on the same account. `from` is deliberately
+/// excluded: that is the other party, and matching against it would only fire
+/// on self-addressed mail.
+///
+/// Order matters — To before CC — because `resolve_send_identity` takes the
+/// first match, and a direct addressee is a better From than a CC.
+fn parent_addressed_identities(parent: &Value) -> Vec<String> {
     let mut out = Vec::new();
-    for f in fields {
+    for f in ["to", "cc"] {
         if let Some(arr) = parent.get(f).and_then(Value::as_array) {
             for p in arr {
                 if let Some(addr) = p.get("email").and_then(Value::as_str) {
@@ -874,33 +899,6 @@ fn recipient_addr_set(parent: &Value, reply_to_all: bool) -> Vec<String> {
         }
     }
     out
-}
-
-/// Pick the caller identity whose email is among `recipient_addrs`; returns
-/// `(email, identity_id)`. Falls back to the first identity if none matched.
-fn pick_reply_identity(
-    identities: &[Value],
-    recipient_addrs: &[String],
-) -> Option<(String, String)> {
-    let matched = identities.iter().find(|i| {
-        i.get("email")
-            .and_then(Value::as_str)
-            .is_some_and(|e| recipient_addrs.contains(&e.to_ascii_lowercase()))
-    });
-    matched
-        .or_else(|| identities.first())
-        .and_then(identity_pair)
-}
-
-/// The default (first) identity as `(email, identity_id)`.
-fn first_identity(identities: &[Value]) -> Option<(String, String)> {
-    identities.first().and_then(identity_pair)
-}
-
-fn identity_pair(i: &Value) -> Option<(String, String)> {
-    let email = i.get("email").and_then(Value::as_str)?.to_owned();
-    let id = i.get("id").and_then(Value::as_str)?.to_owned();
-    Some((email, id))
 }
 
 #[cfg(test)]
@@ -930,21 +928,18 @@ mod tests {
         assert_eq!(objs[1], json!({ "email": "b@x.test" }));
     }
 
+    /// A To addressee beats a CC addressee.
     #[test]
-    fn pick_reply_identity_prefers_recipient_match() {
-        let identities = vec![
-            json!({ "id": "I1", "email": "default@x.test" }),
-            json!({ "id": "I2", "email": "me@x.test" }),
-        ];
-        let recips = vec!["me@x.test".to_owned()];
+    fn addressed_identities_put_to_before_cc() {
+        let parent = json!({
+            "to": [ { "email": "To@x.test" } ],
+            "cc": [ { "email": "cc@x.test" } ],
+            "from": [ { "email": "sender@x.test" } ]
+        });
+        // Lower-cased, To first, and the parent's `from` is excluded.
         assert_eq!(
-            pick_reply_identity(&identities, &recips),
-            Some(("me@x.test".to_owned(), "I2".to_owned()))
-        );
-        // No match → falls back to first.
-        assert_eq!(
-            pick_reply_identity(&identities, &[]),
-            Some(("default@x.test".to_owned(), "I1".to_owned()))
+            parent_addressed_identities(&parent),
+            vec!["to@x.test".to_owned(), "cc@x.test".to_owned()]
         );
     }
 }

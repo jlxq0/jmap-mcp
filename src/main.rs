@@ -1,7 +1,8 @@
 //! `jmap-mcp` — Remote MCP server exposing a Stalwart JMAP mailbox to
 //! claude.ai. Ported from `matrix-mcp`.
 //!
-//! Inbound requests are authenticated against Logto (JWKS + RS256); the
+//! Inbound requests are authenticated against Logto (JWKS plus an allowlist
+//! of asymmetric signing algorithms); the
 //! validated bearer is forwarded verbatim to Stalwart on every JMAP call.
 //! Stateless: no per-user store, no E2EE, no PVC.
 
@@ -27,15 +28,16 @@ mod url_safety;
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
+use axum::{Json, Router};
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::net::TcpListener;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -46,6 +48,11 @@ use crate::logto_oidc::LogtoValidationClient;
 use crate::mcp::JmapMcpService;
 use crate::oauth_metadata::{authorization_server_metadata, protected_resource_metadata, register};
 use crate::rate_limit::{InitializeLimiter, Limiter, MAX_INITIALIZES_PER_IDENTITY};
+
+/// MCP JSON-RPC requests are small; cap the transport body before rmcp
+/// collects it into memory. Four MiB leaves ample room for batched tool
+/// arguments while preventing a valid bearer from exhausting the process.
+const MCP_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -132,7 +139,7 @@ fn build_router(
     );
 
     let initialize_limiter = Arc::new(InitializeLimiter::new(
-        session::SESSION_KEEP_ALIVE,
+        crate::rate_limit::INITIALIZE_REFILL_INTERVAL,
         MAX_INITIALIZES_PER_IDENTITY,
     ));
 
@@ -147,6 +154,7 @@ fn build_router(
             auth_state.clone(),
             bearer_auth,
         ))
+        .layer(RequestBodyLimitLayer::new(MCP_MAX_REQUEST_BYTES))
         .with_state(auth_state);
 
     Router::new()
@@ -191,7 +199,10 @@ fn build_router(
 }
 
 async fn health() -> impl IntoResponse {
-    (StatusCode::OK, "ok\n")
+    Json(serde_json::json!({
+        "status": "healthy",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 /// Rejects fresh MCP session creation when the caller's per-identity
@@ -227,13 +238,45 @@ async fn initialize_rate_limit(
         .check(&bearer_hash, Some(identity.user_id.as_str()))
         .is_err()
     {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many MCP initialize requests; try again later\n",
-        )
-            .into_response();
+        return initialize_rate_limited();
     }
     next.run(request).await
+}
+
+/// 429 for a throttled `initialize`.
+///
+/// Shaped as a JSON-RPC error rather than bare text: the client posted a
+/// JSON-RPC `initialize`, and one that cannot parse the response has no way
+/// to distinguish throttling from a broken server — it reports a dead
+/// connector. `Retry-After` (seconds, per the bucket's refill rate) tells a
+/// well-behaved client exactly how long to wait. `id` is null because the
+/// body is not parsed at this layer (JSON-RPC 2.0 §5 allows null when the id
+/// cannot be determined).
+fn initialize_rate_limited() -> axum::response::Response {
+    let retry_after = crate::rate_limit::INITIALIZE_REFILL_INTERVAL.as_secs();
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": serde_json::Value::Null,
+        "error": {
+            "code": crate::audit::RATE_LIMITED_CODE,
+            "message": format!(
+                "Too many MCP session initializations for this identity. \
+                 Retry in {retry_after}s; reuse the existing session where possible."
+            ),
+        },
+    });
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            (axum::http::header::RETRY_AFTER, retry_after.to_string()),
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_owned(),
+            ),
+        ],
+        axum::Json(body),
+    )
+        .into_response()
 }
 
 fn is_fresh_mcp_session_request(request: &Request<Body>) -> bool {
@@ -338,6 +381,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            r.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["status"], "healthy");
+        assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[tokio::test]
@@ -361,6 +414,70 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(www.contains("oauth-protected-resource/mcp"));
+    }
+
+    #[tokio::test]
+    async fn oversized_mcp_body_is_rejected_before_collection() {
+        let app = router(test_config());
+        let r = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::CONTENT_LENGTH, MCP_MAX_REQUEST_BYTES + 1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// A throttled initialize must be machine-readable: JSON-RPC body so the
+    /// client can tell throttling from a broken server, and `Retry-After` so
+    /// it backs off instead of hammering or declaring the connector dead.
+    #[tokio::test]
+    async fn initialize_429_is_json_rpc_with_retry_after() {
+        let r = initialize_rate_limited();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let retry_after = r
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("Retry-After present")
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .expect("Retry-After is an integer number of seconds");
+        assert_eq!(
+            retry_after,
+            crate::rate_limit::INITIALIZE_REFILL_INTERVAL.as_secs()
+        );
+
+        let bytes = axum::body::to_bytes(r.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON-RPC body");
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["error"]["code"], crate::audit::RATE_LIMITED_CODE);
+    }
+
+    /// The initialize bucket must absorb an ordinary reconnect storm. Cursor
+    /// alone opens two sessions per connect, so a handful of connects cannot
+    /// be allowed to lock the identity out of its first tool call.
+    #[test]
+    fn initialize_burst_absorbs_repeated_reconnects() {
+        let limiter = crate::rate_limit::InitializeLimiter::new(
+            crate::rate_limit::INITIALIZE_REFILL_INTERVAL,
+            MAX_INITIALIZES_PER_IDENTITY,
+        );
+        // Ten back-to-back connects at two sessions each: all must pass.
+        for i in 0..20 {
+            assert!(
+                limiter.check("bearer-hash", Some("user-sub")).is_ok(),
+                "initialize {i} should not be throttled"
+            );
+        }
     }
 
     #[tokio::test]

@@ -52,12 +52,18 @@ pub struct ProtectedResourceMetadata {
 ///
 /// RFC 9728 §3.3 and the MCP authorization spec require `resource` to match
 /// the URL the client actually connects to. claude.ai tolerates the bare
-/// origin; stricter clients (Grok Bot, LangDock) reject a token whose
+/// origin; stricter clients (Grok Bot, `LangDock`) reject a token whose
 /// advertised resource is the origin when they connected to `{origin}/mcp`.
 ///
-/// `cfg.resource_url` stays the origin: it is the JWT audience Logto issues,
-/// the RFC 8414 issuer, and the `/oauth/callback` base. Do not change
-/// `JMAP_MCP_RESOURCE_URL` to include `/mcp`.
+/// `cfg.resource_url` is always the bare origin: it is the JWT audience Logto
+/// issues (and that Stalwart's directory `requireAudience` must match
+/// byte-for-byte), the RFC 8414 issuer, and the `/oauth/callback` base.
+///
+/// `JMAP_MCP_RESOURCE_URL` may be *written* either way — `canonical_resource_origin`
+/// in `config.rs` strips a trailing `/mcp` — but it always lands here as the
+/// origin, so this function appends `/mcp` exactly once. Do not "simplify"
+/// this by dropping the append when the env var already carries the suffix:
+/// the suffix is normalised away before it reaches any config field.
 pub fn mcp_resource(resource_url: &str) -> String {
     format!("{}/mcp", resource_url.trim_end_matches('/'))
 }
@@ -198,8 +204,39 @@ fn now_unix() -> i64 {
 
 /// Build the `WWW-Authenticate` value our 401 responses set. claude.ai parses
 /// `resource_metadata` and walks back to discover the authorization server.
+///
+/// The metadata URL is the RFC 9728 §3.1 path-aware variant
+/// (`/.well-known/oauth-protected-resource/mcp`) because clients canonicalise
+/// this server as `<origin>/mcp`. Do not move it back to the origin.
 pub fn www_authenticate_header(resource_url: &str) -> String {
-    format!(r#"Bearer resource_metadata="{resource_url}/.well-known/oauth-protected-resource/mcp""#)
+    challenge(resource_url, None)
+}
+
+/// Challenge for a request that *did* present a bearer we rejected.
+///
+/// RFC 6750 §3 / RFC 9728 §5.1: when a token was supplied and refused, the
+/// challenge carries `error="invalid_token"`. Clients use that to tell
+/// "this token is bad, re-run OAuth" apart from "no token supplied" — some
+/// (Cursor, Grok Bot) will not refresh without it, and instead surface a
+/// dead connector to the user.
+pub fn www_authenticate_invalid_token(resource_url: &str) -> String {
+    challenge(resource_url, Some("invalid_token"))
+}
+
+fn challenge(resource_url: &str, error: Option<&str>) -> String {
+    let base = resource_url.trim_end_matches('/');
+    let mut v =
+        format!(r#"Bearer resource_metadata="{base}/.well-known/oauth-protected-resource/mcp""#);
+    if let Some(error) = error {
+        use std::fmt::Write as _;
+        // `error` first is also legal; appending keeps `resource_metadata`
+        // at a stable offset for the naive substring parsers in the wild.
+        let _ = write!(
+            v,
+            r#", error="{error}", error_description="The access token is expired, revoked, or was issued for a different resource.""#
+        );
+    }
+    v
 }
 
 #[cfg(test)]

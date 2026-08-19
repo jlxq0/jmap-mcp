@@ -27,9 +27,9 @@ pub const CAP_SUBMISSION: &str = "urn:ietf:params:jmap:submission";
 /// How long a discovered Session is cached before re-fetching.
 /// `from_secs(3600)` not `from_hours(1)`: the unit constructors are unstable
 /// on our pinned Rust 1.93 toolchain.
-#[allow(clippy::duration_suboptimal_units)]
+#[allow(unknown_lints, clippy::duration_suboptimal_units)]
 const SESSION_TTL: Duration = Duration::from_secs(3600);
-const SESSION_SOFT_CAP: usize = 256;
+const SESSION_CAP: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum JmapError {
@@ -351,8 +351,17 @@ impl JmapClient {
         let Ok(mut g) = self.sessions.write() else {
             return;
         };
-        if g.len() >= SESSION_SOFT_CAP {
+        if g.len() >= SESSION_CAP {
             g.retain(|_, c| c.cached_at.elapsed() < SESSION_TTL);
+        }
+        if g.len() >= SESSION_CAP
+            && !g.contains_key(&key)
+            && let Some(oldest) = g
+                .iter()
+                .max_by_key(|(_, cached)| cached.cached_at.elapsed())
+                .map(|(key, _)| *key)
+        {
+            g.remove(&oldest);
         }
         g.insert(
             key,
@@ -442,5 +451,121 @@ mod tests {
     fn url_escape_leaves_unreserved() {
         assert_eq!(url_escape("abc-1.2_3~"), "abc-1.2_3~");
         assert_eq!(url_escape("a/b c"), "a%2Fb%20c");
+    }
+
+    #[test]
+    fn session_cache_is_hard_capped() {
+        let client = JmapClient::new("https://mail.example.test", None).unwrap();
+        let session: JmapSession = serde_json::from_value(session_body()).unwrap();
+        for i in 0..=SESSION_CAP {
+            let mut key = [0_u8; 32];
+            key[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            client.session_insert(key, &session);
+        }
+        assert_eq!(client.sessions.read().unwrap().len(), SESSION_CAP);
+    }
+
+    // ----- session discovery against a mock Stalwart -----
+
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn session_body() -> Value {
+        json!({
+            "apiUrl": "https://mail.example.test/jmap/",
+            "downloadUrl": "https://mail.example.test/jmap/download/{accountId}/{blobId}/{name}?type={type}",
+            "uploadUrl": "https://mail.example.test/jmap/upload/{accountId}/",
+            "username": "julian@kampong.social",
+            "primaryAccounts": { CAP_MAIL: "acct-1" }
+        })
+    }
+
+    /// The data `whoami` reports comes straight off the discovered session:
+    /// the account id, and the username it falls back to when the Logto
+    /// token carried no `email` claim. This is the path that answered
+    /// `InvalidAudience` in the 2026-08 incident.
+    #[tokio::test]
+    async fn session_discovery_yields_username_and_account_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jmap"))
+            .and(header("authorization", "Bearer live-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(session_body()))
+            .mount(&server)
+            .await;
+
+        let client = JmapClient::new(&server.uri(), None).unwrap();
+        let session = client.session_for("live-token").await.unwrap();
+
+        assert_eq!(session.username.as_deref(), Some("julian@kampong.social"));
+        assert_eq!(session.mail_account_id(), Some("acct-1"));
+        assert_eq!(
+            client.account_id("live-token").await.unwrap(),
+            "acct-1".to_owned()
+        );
+    }
+
+    /// Second call is served from cache — one upstream request only.
+    #[tokio::test]
+    async fn session_is_cached_per_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jmap"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(session_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = JmapClient::new(&server.uri(), None).unwrap();
+        client.session_for("live-token").await.unwrap();
+        client.session_for("live-token").await.unwrap();
+        // `expect(1)` is asserted on drop.
+    }
+
+    /// Stalwart refusing the bearer (what `requireAudience` produced) must
+    /// surface as `Unauthorized`, which is what the MCP layer keys on.
+    #[tokio::test]
+    async fn stalwart_401_maps_to_unauthorized() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jmap"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let client = JmapClient::new(&server.uri(), None).unwrap();
+        assert!(matches!(
+            client.session_for("rejected-token").await,
+            Err(JmapError::Unauthorized)
+        ));
+    }
+
+    /// A rejection must not leave a poisoned cache entry behind.
+    #[tokio::test]
+    async fn unauthorized_evicts_cached_session() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jmap"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(session_body()))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let client = JmapClient::new(&server.uri(), None).unwrap();
+        client.session_for("tok").await.unwrap();
+        assert!(client.session_lookup(&hash_token("tok")).is_some());
+
+        // Backend now rejects: the cached session must be dropped.
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jmap"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        client.evict("tok");
+        assert!(matches!(
+            client.session_for("tok").await,
+            Err(JmapError::Unauthorized)
+        ));
+        assert!(client.session_lookup(&hash_token("tok")).is_none());
     }
 }

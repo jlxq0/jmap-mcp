@@ -1,6 +1,6 @@
 [package]
 name = "jmap-mcp"
-version = "0.0.1"
+version = "0.2.10"
 edition = "2024"
 rust-version = "1.93"
 description = "Remote MCP server exposing a Stalwart JMAP mailbox to claude.ai"
@@ -9,11 +9,8 @@ repository = "https://github.com/jlxq0/jmap-mcp"
 publish = false
 
 [dependencies]
-tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "rt", "signal", "net", "time"] }
+tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "rt", "signal", "net", "sync", "time"] }
 axum = "0.7"
-# `axum-extra` kept for parity with the matrix-mcp router shape (typed
-# cookie/Form extractors), used by the optional static /setup docs page.
-axum-extra = { version = "0.9", features = ["cookie"] }
 base64 = "0.22"
 # Prometheus metrics, text-format only (drops the vulnerable protobuf 2.x dep).
 prometheus = { version = "0.13", default-features = false }
@@ -22,7 +19,7 @@ prometheus = { version = "0.13", default-features = false }
 governor = "0.7"
 http = "1"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["limit", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # OpenTelemetry tracing export. Active only when OTEL_EXPORTER_OTLP_ENDPOINT
@@ -45,8 +42,8 @@ sha2 = "0.10"
 subtle = "2.6"
 # Random suffixes for JMAP method call ids / Message-ID generation.
 rand = "0.8"
-# Logto access-token validation: RS256 JWT signature + aud/exp checks against
-# the JWKS published at {authorization_server}/jwks.
+# Logto access-token validation: allowlisted asymmetric JWT signatures plus
+# aud/exp checks against the JWKS published at {authorization_server}/jwks.
 jsonwebtoken = "9.3"
 # Official MCP Rust SDK. `transport-streamable-http-server` enables the
 # session manager + http transport we mount via `Router::nest_service`.

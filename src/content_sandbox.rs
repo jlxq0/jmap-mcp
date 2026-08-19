@@ -160,25 +160,50 @@ fn escape_injection_markers(body: &str) -> String {
     // match. First handle the canonical form (keep the pretty escape
     // both ends), then catch any remaining `</email:message` prefix
     // regardless of trailing characters.
-    s = s.replace("</email:message>", "&lt;/email:message&gt;");
-    s = s.replace("</email:message", "&lt;/email:message");
-    s = s.replace("<email:message", "&lt;email:message");
+    s = replace_ascii_case_insensitive(&s, "</email:message>", "&lt;/email:message&gt;");
+    s = replace_ascii_case_insensitive(&s, "</email:message", "&lt;/email:message");
+    s = replace_ascii_case_insensitive(&s, "<email:message", "&lt;email:message");
 
     for tok in ANGLE_ROLE_TOKENS {
-        if s.contains(tok) {
-            let escaped: String = tok.replace('<', "&lt;").replace('>', "&gt;");
-            s = s.replace(tok, &escaped);
-        }
+        let escaped: String = tok.replace('<', "&lt;").replace('>', "&gt;");
+        s = replace_ascii_case_insensitive(&s, tok, &escaped);
     }
 
     for tok in BRACKET_ROLE_TOKENS {
-        if s.contains(tok) {
-            let escaped: String = tok.replace('[', "&#91;").replace(']', "&#93;");
-            s = s.replace(tok, &escaped);
-        }
+        let escaped: String = tok.replace('[', "&#91;").replace(']', "&#93;");
+        s = replace_ascii_case_insensitive(&s, tok, &escaped);
     }
 
     s
+}
+
+fn replace_ascii_case_insensitive(input: &str, needle: &str, replacement: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    let mut out = String::with_capacity(input.len());
+    let mut start = 0;
+    while let Some(relative) = lower[start..].find(&needle) {
+        let found = start + relative;
+        out.push_str(&input[start..found]);
+        out.push_str(replacement);
+        start = found + needle.len();
+    }
+    out.push_str(&input[start..]);
+    out
+}
+
+/// Neutralize role/control delimiters in an untrusted envelope field without
+/// adding the body wrapper. Useful for subjects, display names, and filenames
+/// whose existing JSON shape must remain compatible.
+#[must_use]
+pub fn sanitize_external_text(text: &str) -> String {
+    escape_injection_markers(text)
+}
+
+/// Apply the same injection heuristics used for bodies to an envelope field.
+#[must_use]
+pub fn external_text_is_suspicious(text: &str) -> bool {
+    is_suspicious(text)
 }
 
 /// Escape a string for use inside an XML/HTML double-quoted attribute
@@ -301,6 +326,16 @@ mod tests {
             !v.wrapped.contains("<system>"),
             "raw <system> must not survive"
         );
+    }
+
+    #[test]
+    fn mixed_case_role_tokens_are_escaped() {
+        for text in ["<SyStEm>bad</SYSTEM>", "[iNsT] bad [/InSt]"] {
+            let sanitized = sanitize_external_text(text);
+            assert!(!sanitized.to_ascii_lowercase().contains("<system>"));
+            assert!(!sanitized.to_ascii_lowercase().contains("[inst]"));
+            assert!(external_text_is_suspicious(text));
+        }
     }
 
     #[test]
