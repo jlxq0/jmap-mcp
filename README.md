@@ -154,9 +154,9 @@ operator.
   byte limits.
 - In-memory caches, pending OAuth state, rate-limit key maps, MCP sessions, and
   request bodies have hard bounds.
-- Release CI runs formatting, Clippy, tests, RustSec, cargo-deny, container
-  vulnerability scanning, SBOM generation, provenance attestation, and keyless
-  image signing.
+- Release CI runs formatting, Clippy, tests, independent RustSec and OSV
+  dependency audits, cargo-deny, container vulnerability scanning, SBOM
+  generation, provenance attestation, and keyless image signing.
 
 See [SECURITY.md](SECURITY.md) for reporting and supported-version policy.
 

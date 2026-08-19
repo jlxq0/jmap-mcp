@@ -53,6 +53,18 @@ jobs:
         run: |
           [ -x ~/.cargo/bin/cargo-audit ] || cargo install --locked cargo-audit --version 0.22.1
           cargo audit
+      - name: OSV dependency audit
+        env:
+          OSV_SCANNER_VERSION: 2.5.1
+          OSV_SCANNER_SHA256: f9f25499a2c8cc367b3af45df2ea7eeca7fbccceab9c35079968f4b3652194be
+        run: |
+          set -euo pipefail
+          binary="/tmp/osv-scanner"
+          curl -sSL -o "$binary" \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  ${binary}" | sha256sum -c -
+          chmod +x "$binary"
+          "$binary" --lockfile=./Cargo.lock
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # v2.1.1
         with: { command: check bans licenses sources }
 

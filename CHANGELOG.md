@@ -9,6 +9,9 @@ All notable changes are recorded here. The project uses semantic version tags.
 - Hard-cap JMAP sessions, token-validation results, pending OAuth state,
   rate-limiter keys, MCP sessions, and request bodies.
 - Serialize JWKS refresh and apply a global cooldown for unknown key IDs.
+- Upgrade `jsonwebtoken` to fix CVE-2026-25537 claim type confusion and the
+  OpenTelemetry stack to fix CVE-2026-48504 baggage allocation denial of
+  service.
 - Pin validated socket addresses for remote attachment fetches, reject
   reserved address space, and bypass environment proxies.
 - Refresh the distroless runtime base to include Debian's fix for
