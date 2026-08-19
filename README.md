@@ -90,9 +90,10 @@ The following identifiers must remain aligned:
    `JMAP_MCP_DCR_CLIENT_ID`; no client secret is used by the DCR flow.
 3. Register `https://jmap-mcp.your-domain.example/oauth/callback` as the Logto
    application's redirect URI.
-4. Put every MCP client's exact callback URI in
-   `JMAP_MCP_OAUTH_REDIRECT_URIS`. Matching is exact. HTTPS callbacks, loopback
-   HTTP callbacks, and native private-use schemes are supported.
+4. Put every MCP client's callback URI in `JMAP_MCP_OAUTH_REDIRECT_URIS`.
+   HTTPS and native private-use callbacks match exactly. Loopback HTTP
+   callbacks match the configured host, path, and query while allowing the
+   client to choose an ephemeral local port, as required by RFC 8252.
 5. Configure Stalwart's OIDC directory to trust the same Logto issuer, accept
    the jmap-mcp origin as the token audience, and map the token's `username`,
    `email`, or `sub` claim to the mailbox principal.
@@ -117,7 +118,7 @@ ending in `/mcp`; jmap-mcp canonicalises it to the bare origin and advertises
 | `JMAP_MCP_AUTHORIZATION_SERVER` | yes | — | Logto OIDC issuer, normally ending in `/oidc` |
 | `JMAP_MCP_STALWART_JMAP_BASE_URL` | yes | — | Stalwart base used for `/.well-known/jmap` discovery |
 | `JMAP_MCP_DCR_CLIENT_ID` | for DCR clients | disabled | Pre-provisioned public Logto client returned by `/register` |
-| `JMAP_MCP_OAUTH_REDIRECT_URIS` | for OAuth proxy | empty | Comma-separated exact MCP client callback allowlist |
+| `JMAP_MCP_OAUTH_REDIRECT_URIS` | for OAuth proxy | empty | Comma-separated MCP client callback allowlist; only loopback HTTP ports may vary |
 | `JMAP_MCP_BIND_ADDR` | no | `0.0.0.0:3000` | Public HTTP listener |
 | `JMAP_MCP_METRICS_BIND_ADDR` | no | `127.0.0.1:9090` | Internal Prometheus listener; never publish it directly |
 | `POD_IP` | no | — | Derives the metrics listener as `<pod-ip>:9090` in Kubernetes |

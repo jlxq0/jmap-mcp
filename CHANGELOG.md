@@ -2,6 +2,15 @@
 
 All notable changes are recorded here. The project uses semantic version tags.
 
+## 0.2.11 — 2026-08-19
+
+### Fixed
+
+- Accept an OAuth native client's ephemeral loopback listener port while still
+  requiring the configured loopback host, path, and query to match. This makes
+  Claude Code registration interoperable without weakening HTTPS or
+  private-use callback matching.
+
 ## 0.2.10 — 2026-08-19
 
 ### Security
