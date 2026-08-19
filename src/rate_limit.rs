@@ -70,7 +70,7 @@ pub const MAX_INITIALIZES_PER_IDENTITY: u32 = 32;
 /// identity sustains ~30 concurrent sessions against a 30-minute idle TTL —
 /// comfortably inside the 256-session cap — while a real user's reconnect
 /// storm clears in seconds.
-#[allow(clippy::duration_suboptimal_units)] // `from_hours`/`from_mins` unstable on 1.93
+#[allow(unknown_lints, clippy::duration_suboptimal_units)] // `from_hours`/`from_mins` unstable on 1.93
 pub const INITIALIZE_REFILL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Limiter type alias — `governor`'s direct (non-keyed) variant; we
@@ -248,7 +248,7 @@ impl InitializeLimiter {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::duration_suboptimal_units)]
+#[allow(unknown_lints, clippy::unwrap_used, clippy::duration_suboptimal_units)]
 mod tests {
     use super::*;
 

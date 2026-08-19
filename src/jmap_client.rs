@@ -27,7 +27,7 @@ pub const CAP_SUBMISSION: &str = "urn:ietf:params:jmap:submission";
 /// How long a discovered Session is cached before re-fetching.
 /// `from_secs(3600)` not `from_hours(1)`: the unit constructors are unstable
 /// on our pinned Rust 1.93 toolchain.
-#[allow(clippy::duration_suboptimal_units)]
+#[allow(unknown_lints, clippy::duration_suboptimal_units)]
 const SESSION_TTL: Duration = Duration::from_secs(3600);
 const SESSION_CAP: usize = 256;
 
