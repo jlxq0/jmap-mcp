@@ -1,14 +1,18 @@
 # syntax=docker/dockerfile:1.7
 
 # Multi-stage build → distroless runtime. Final image ~20-25 MiB.
-# Unlike matrix-mcp, jmap-mcp has NO C build deps (no libopus/CMake) and no
-# bundled SQLite — it's a stateless JMAP MCP server. Pure-Rust + rustls.
+# Unlike matrix-mcp, jmap-mcp has no media or SQLite build dependencies. CMake
+# is used only to compile jsonwebtoken's vendored AWS-LC cryptography backend.
 
 ARG RUST_VERSION=1.93
 # Digest pinned to rust:1.93-bookworm (OCI index). Update via Renovate.
 FROM rust:${RUST_VERSION}-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31 AS builder
 
 WORKDIR /build
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends cmake && \
+    rm -rf /var/lib/apt/lists/*
 
 # Cache dependencies separately from source: copy manifest first, build a
 # stub, then copy real source. `cargo build` only re-runs the slow dependency
