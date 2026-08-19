@@ -325,6 +325,20 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
     }
 
+    #[tokio::test]
+    async fn register_accepts_ephemeral_port_for_allowlisted_loopback_callback() {
+        let mut cfg = test_config();
+        cfg.dcr_client_id = Some("abc123".to_owned());
+        cfg.oauth_redirect_uris = vec!["http://localhost:8787/callback".to_owned()];
+        let body = json!({
+            "redirect_uris": ["http://localhost:49152/callback"],
+        });
+
+        let response = register(State(cfg), Some(Json(body))).await.into_response();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
     #[test]
     fn www_authenticate_includes_resource_metadata_url() {
         let h = www_authenticate_header("https://jmap-mcp.example.test");

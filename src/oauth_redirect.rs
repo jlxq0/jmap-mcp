@@ -3,7 +3,11 @@
 use anyhow::{Context, Result};
 use url::Url;
 
-/// Comma-separated exact redirect URI allowlist for proxied OAuth clients.
+/// Comma-separated redirect URI allowlist for proxied OAuth clients.
+///
+/// HTTPS and private-use callbacks match exactly. Loopback HTTP callbacks
+/// match the configured host, path, and query while allowing the client to
+/// choose its local listener port, as required for native OAuth clients.
 pub const ENV_OAUTH_REDIRECT_URIS: &str = "JMAP_MCP_OAUTH_REDIRECT_URIS";
 
 pub fn parse_allowlist(raw: &str, key: &str) -> Result<Vec<String>> {
@@ -21,8 +25,33 @@ pub fn parse_allowlist(raw: &str, key: &str) -> Result<Vec<String>> {
 }
 
 pub fn is_allowed_redirect_uri(allowed: &[String], uri: &str) -> bool {
-    validate_redirect_uri(uri, "redirect_uri").is_ok()
-        && allowed.iter().any(|allowed| allowed == uri)
+    if validate_redirect_uri(uri, "redirect_uri").is_err() {
+        return false;
+    }
+
+    let Ok(candidate) = Url::parse(uri) else {
+        return false;
+    };
+
+    allowed
+        .iter()
+        .any(|configured| configured == uri || loopback_redirect_matches(configured, &candidate))
+}
+
+/// RFC 8252 loopback redirects use an ephemeral port. Keep every other URI
+/// component pinned to the operator's allowlist entry so variable ports do not
+/// become a general wildcard.
+fn loopback_redirect_matches(configured: &str, candidate: &Url) -> bool {
+    let Ok(configured) = Url::parse(configured) else {
+        return false;
+    };
+
+    configured.scheme() == "http"
+        && candidate.scheme() == "http"
+        && configured.host_str().is_some_and(is_loopback_host)
+        && configured.host_str() == candidate.host_str()
+        && configured.path() == candidate.path()
+        && configured.query() == candidate.query()
 }
 
 /// Loopback hosts accepted for cleartext `http://` redirect URIs
@@ -59,9 +88,9 @@ fn validate_redirect_uri(uri: &str, key: &str) -> Result<()> {
         }
         // RFC 8252 §7.1 private-use ("custom") URI schemes, e.g.
         // `cursor://…` / `grokbot://…` used by native MCP clients. The exact
-        // string allowlist in `is_allowed_redirect_uri` is the actual control
-        // — an operator must list the URI explicitly — so this arm only
-        // rejects structurally broken input.
+        // allowlist in `is_allowed_redirect_uri` is the actual control — an
+        // operator must list the URI explicitly — so this arm only rejects
+        // structurally broken input.
         scheme => {
             if scheme.is_empty() {
                 anyhow::bail!("{key} entries must have a scheme: {uri}");
@@ -97,6 +126,35 @@ mod tests {
         assert!(!is_allowed_redirect_uri(
             &allowed,
             "https://attacker.example/callback"
+        ));
+    }
+
+    /// RFC 8252 section 7.3 requires authorization servers to accept the
+    /// ephemeral port selected by a native client's loopback listener. Claude
+    /// Code uses this shape even when a preferred callback port is configured.
+    #[test]
+    fn loopback_allowlist_varies_only_the_port() {
+        let allowed = parse_allowlist("http://localhost:8787/callback", "TEST").unwrap();
+
+        assert!(is_allowed_redirect_uri(
+            &allowed,
+            "http://localhost:49152/callback"
+        ));
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "http://127.0.0.1:49152/callback"
+        ));
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "http://localhost:49152/other"
+        ));
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "http://localhost:49152/callback?next=evil"
+        ));
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "https://localhost:49152/callback"
         ));
     }
 
