@@ -62,6 +62,16 @@ const ENV_TRUSTED_PROXY_HOPS: &str = "JMAP_MCP_TRUSTED_PROXY_HOPS";
 /// dial the in-cluster Service `ClusterIP` on port 443.
 const ENV_STALWART_CONNECT_IP: &str = "JMAP_MCP_STALWART_CONNECT_IP";
 
+/// Additional addresses this mailbox may send as, declared by the operator.
+///
+/// Stalwart exposes a principal's aliases only through `x:Account/get` /
+/// `x:Account/query`, which require the `sysAccountGet` / `sysAccountQuery`
+/// permissions. An ordinary mail user's OAuth token carries neither, so alias
+/// discovery is unavailable in the normal deployment and the mailbox's own
+/// aliases are invisible. This lets the operator name them explicitly instead
+/// of granting the server admin rights over the mail server.
+pub const ENV_EXTRA_FROM_ADDRESSES: &str = "JMAP_MCP_EXTRA_FROM_ADDRESSES";
+
 const DEFAULT_RATE_LIMIT_READS: u32 = 60;
 const DEFAULT_RATE_LIMIT_WRITES: u32 = 30;
 const DEFAULT_DOWNLOAD_MAX_BYTES: u64 = 5 * 1024 * 1024;
@@ -103,6 +113,10 @@ pub struct Config {
     pub dcr_client_id: Option<String>,
     /// Exact OAuth redirect URIs accepted by the proxy and DCR shim.
     pub oauth_redirect_uris: Vec<String>,
+    /// Operator-declared addresses this mailbox may send as, in addition to
+    /// the JMAP identities. Lower-cased, de-duplicated, and guaranteed free of
+    /// role addresses by [`parse_extra_from_addresses`].
+    pub extra_from_addresses: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -151,6 +165,7 @@ impl Config {
             stalwart_connect_ip: None,
             dcr_client_id: None,
             oauth_redirect_uris: Vec::new(),
+            extra_from_addresses: Vec::new(),
         })
     }
 
@@ -201,6 +216,7 @@ impl Config {
             .ok()
             .filter(|s| !s.trim().is_empty());
         cfg.oauth_redirect_uris = parse_redirect_uris_env()?;
+        cfg.extra_from_addresses = parse_extra_from_addresses_env()?;
 
         // Optional opaque-token introspection fallback credentials.
         if let (Ok(client_id), Ok(client_secret)) = (
@@ -311,6 +327,50 @@ fn parse_redirect_uris_env() -> Result<Vec<String>> {
     }
 }
 
+fn parse_extra_from_addresses_env() -> Result<Vec<String>> {
+    match std::env::var(ENV_EXTRA_FROM_ADDRESSES) {
+        Ok(raw) => parse_extra_from_addresses(&raw),
+        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(e) => Err(e).with_context(|| format!("invalid {ENV_EXTRA_FROM_ADDRESSES}")),
+    }
+}
+
+/// Parse a comma- or whitespace-separated address allowlist.
+///
+/// Rejects the whole configuration rather than dropping a bad entry: a typo
+/// that silently disappears is how an operator ends up believing an address is
+/// sendable when it is not. Role addresses are refused here as well as at send
+/// time, so a shared inbox cannot be turned into a personal `From` by config.
+pub fn parse_extra_from_addresses(raw: &str) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in raw.split([',', '\n', '\r', '\t', ' ']) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let addr = entry.to_ascii_lowercase();
+        let mut parts = addr.split('@');
+        let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
+            anyhow::bail!(
+                "{ENV_EXTRA_FROM_ADDRESSES}: {entry} is not a single user@domain address"
+            );
+        };
+        if local.is_empty() || domain.is_empty() || !domain.contains('.') {
+            anyhow::bail!("{ENV_EXTRA_FROM_ADDRESSES}: {entry} is not a valid user@domain address");
+        }
+        if crate::mcp::is_role_address(&addr) {
+            anyhow::bail!(
+                "{ENV_EXTRA_FROM_ADDRESSES}: {entry} is a shared role address and must never be \
+                 configured as a personal From"
+            );
+        }
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    Ok(out)
+}
+
 fn parse_trusted_proxy_hops() -> Result<usize> {
     std::env::var(ENV_TRUSTED_PROXY_HOPS).map_or_else(
         |_| Ok(DEFAULT_TRUSTED_PROXY_HOPS),
@@ -327,6 +387,61 @@ fn strip_trailing_slash(mut s: String) -> String {
         s.pop();
     }
     s
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod extra_from_address_tests {
+    use super::parse_extra_from_addresses;
+
+    #[test]
+    fn parses_separated_and_normalises() {
+        let out = parse_extra_from_addresses("Julian@Lindner.Earth, jl@lindner.sg\n jl@lindner.sg")
+            .expect("valid list");
+        assert_eq!(out, vec!["julian@lindner.earth", "jl@lindner.sg"]);
+    }
+
+    #[test]
+    fn empty_is_empty() {
+        assert!(parse_extra_from_addresses("   ,,\n ").unwrap().is_empty());
+    }
+
+    /// The whole point of the allowlist is that it cannot be used to turn a
+    /// shared inbox into a personal From.
+    #[test]
+    fn role_addresses_are_refused() {
+        for role in [
+            "team@kampong.social",
+            "TEAM@kampong.social",
+            "postmaster@lindner.earth",
+            "julian@lindner.earth, team@kampong.social",
+        ] {
+            let err = parse_extra_from_addresses(role).expect_err("role address must be refused");
+            assert!(
+                err.to_string().contains("role address"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    /// A malformed entry fails the whole configuration rather than vanishing:
+    /// a silently dropped typo leaves the operator believing an address is
+    /// sendable when it is not.
+    #[test]
+    fn malformed_entries_fail_loudly() {
+        for bad in [
+            "notanemail",
+            "two@at@signs.com",
+            "@lindner.earth",
+            "julian@",
+            "julian@local",
+        ] {
+            assert!(
+                parse_extra_from_addresses(bad).is_err(),
+                "{bad} should be rejected"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

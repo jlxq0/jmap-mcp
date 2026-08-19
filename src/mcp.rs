@@ -22,7 +22,7 @@ use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tracing::{Instrument as _, Span, debug, warn};
+use tracing::{Instrument as _, Span, warn};
 
 use crate::audit::{self, outcome};
 use crate::audit_mailbox::AuditMailboxRegistry;
@@ -64,6 +64,9 @@ pub struct JmapMcpService {
     #[allow(dead_code)] // used by upload_blob_from_url (full tool catalogue)
     upload_max_bytes: usize,
     audit_registry: AuditMailboxRegistry,
+    /// Operator-declared sendable addresses, merged into the mailbox's owned
+    /// addresses. See `JMAP_MCP_EXTRA_FROM_ADDRESSES`.
+    extra_from_addresses: Arc<Vec<String>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -81,6 +84,7 @@ impl JmapMcpService {
         download_max_bytes: u64,
         upload_max_bytes: usize,
         audit_registry: AuditMailboxRegistry,
+        extra_from_addresses: Arc<Vec<String>>,
     ) -> Self {
         Self {
             jmap,
@@ -89,6 +93,7 @@ impl JmapMcpService {
             download_max_bytes,
             upload_max_bytes,
             audit_registry,
+            extra_from_addresses,
             tool_router: Self::core_router()
                 + Self::reads_router()
                 + Self::flags_router()
@@ -489,11 +494,19 @@ fn principal_is(account: &Value, username: &str) -> bool {
 /// exists once the domain is resolved — which is why a plain search for
 /// `user@domain` never finds one. Disabled aliases are skipped.
 fn aliases_of(account: &Value, domains: &HashMap<String, String>) -> Vec<OwnedAddress> {
-    let Some(aliases) = account.get("aliases").and_then(Value::as_object) else {
-        return Vec::new();
+    // Stalwart's schema declares `aliases` as a **list** of EmailAlias
+    // objects. Reading it as a map only — as this did — makes `as_object()`
+    // return `None` against a real server and yields zero aliases with no
+    // error, which is exactly how `julian@lindner.earth` stayed invisible
+    // while every unit test passed against a hand-written map fixture.
+    // Accept both shapes.
+    let entries: Vec<&Value> = match account.get("aliases") {
+        Some(Value::Array(list)) => list.iter().collect(),
+        Some(Value::Object(map)) => map.values().collect(),
+        _ => return Vec::new(),
     };
     let mut out = Vec::new();
-    for alias in aliases.values() {
+    for alias in entries {
         if alias.get("enabled").and_then(Value::as_bool) == Some(false) {
             continue;
         }
@@ -1398,10 +1411,18 @@ impl JmapMcpService {
     /// (`team@…`) sitting at the top of the list.
     ///
     /// Aliases come from Stalwart's `urn:stalwart:jmap` extension, which
-    /// stores them as `{name, domainId}` pairs, so domains are resolved in the
-    /// same batch. The whole call is **best-effort**: if the extension is
-    /// unavailable or the caller may not read its own principal, this degrades
-    /// to the identity list rather than failing the tool.
+    /// stores each one as a `{name, domainId}` pair, so domains are resolved
+    /// in the same batch. The whole call is **best-effort**: if the extension
+    /// is unavailable or the caller may not read its own principal, this
+    /// degrades to the identity list rather than failing the tool.
+    ///
+    /// In practice it *always* degrades on this deployment: `x:Account/query`
+    /// and `x:Account/get` require the `sysAccountQuery` and `sysAccountGet`
+    /// permissions, and an ordinary mail user's token carries neither. The
+    /// discovery path is kept because it costs one batched call and works for
+    /// an administrative token, but the addresses users actually send as come
+    /// from `JMAP_MCP_EXTRA_FROM_ADDRESSES`. Granting the server admin rights
+    /// over the mail server would be the wrong trade for a From-address list.
     async fn owned_addresses(
         &self,
         token: &str,
@@ -1428,6 +1449,24 @@ impl JmapMcpService {
                 .any(|a| a.email.eq_ignore_ascii_case(&alias.email))
             {
                 out.push(alias);
+            }
+        }
+
+        // Operator-declared addresses. These carry no Identity of their own —
+        // submission borrows a personal identity while `From` carries the
+        // alias, exactly as a discovered alias does. Role addresses are
+        // already rejected at config-parse time; the filter here keeps that
+        // guarantee local to the merge rather than at a distance.
+        for extra in self.extra_from_addresses.iter() {
+            if is_role_address(extra) {
+                continue;
+            }
+            if !out.iter().any(|a| a.email.eq_ignore_ascii_case(extra)) {
+                out.push(OwnedAddress {
+                    email: extra.clone(),
+                    identity_id: None,
+                    name: None,
+                });
             }
         }
         Ok(out)
@@ -1494,7 +1533,17 @@ impl JmapMcpService {
         {
             Ok(resps) => resps,
             Err(error) if principal_aliases_unavailable(&error) => {
-                debug!("principal alias lookup unavailable; using identities only");
+                // Deliberately louder than debug. `x:Account/query` and
+                // `x:Account/get` need the `sysAccountQuery`/`sysAccountGet`
+                // permissions, which an ordinary mail user's token does not
+                // carry, so this path is the *normal* outcome in production —
+                // and at debug level it made an empty alias list look like a
+                // mailbox that simply has no aliases.
+                warn!(
+                    error = %error,
+                    "principal alias lookup unavailable (needs sysAccountGet/sysAccountQuery); \
+                     falling back to identities plus configured addresses"
+                );
                 return Ok(Vec::new());
             }
             Err(error) => return Err(error),
@@ -1776,6 +1825,146 @@ mod tests {
         );
         assert_eq!(out[0].email, "julian@lindner.earth");
         assert!(out[0].identity_id.is_none());
+    }
+
+    /// The shape Stalwart actually returns. `aliases` is a **list** of
+    /// `EmailAlias` objects, not a map — the map-only reading returned zero
+    /// aliases against the live server while the map fixture above passed,
+    /// which is precisely how this stayed invisible through two releases.
+    #[test]
+    fn aliases_expand_from_the_list_shape_stalwart_returns() {
+        let doms: HashMap<String, String> =
+            std::iter::once(("k".to_owned(), "lindner.earth".to_owned())).collect();
+        let account = json!({ "aliases": [
+            { "name": "julian", "domainId": "k", "enabled": true, "description": "personal" },
+            { "name": "old",    "domainId": "k", "enabled": false },
+            { "name": "orphan", "domainId": "zz", "enabled": true }
+        ]});
+        let out = aliases_of(&account, &doms);
+        assert_eq!(
+            out.len(),
+            1,
+            "disabled and unresolvable aliases are dropped"
+        );
+        assert_eq!(out[0].email, "julian@lindner.earth");
+        assert!(out[0].identity_id.is_none());
+    }
+
+    /// An operator-declared address has no Identity of its own, so it must
+    /// borrow a personal identity to submit under — and must never be the
+    /// account's role address.
+    #[test]
+    fn configured_extra_address_is_sendable_and_borrows_an_identity() {
+        let owned = vec![
+            OwnedAddress {
+                email: "team@kampong.social".into(),
+                identity_id: Some("b".into()),
+                name: None,
+            },
+            OwnedAddress {
+                email: "julian@kampong.social".into(),
+                identity_id: Some("l".into()),
+                name: None,
+            },
+            OwnedAddress {
+                email: "julian@lindner.earth".into(),
+                identity_id: None,
+                name: None,
+            },
+        ];
+        let (from, id) = choose_from_address(
+            &owned,
+            Some("julian@lindner.earth"),
+            &[],
+            Some("julian@kampong.social"),
+        )
+        .expect("configured alias is sendable");
+        assert_eq!(from, "julian@lindner.earth");
+        assert_eq!(id, "l", "borrows the personal identity, never the role one");
+    }
+
+    /// `reply_email` passes the address the parent was delivered to as the
+    /// preferred From. An alias must win there too.
+    #[test]
+    fn reply_prefers_the_alias_the_message_was_addressed_to() {
+        let owned = vec![
+            OwnedAddress {
+                email: "team@kampong.social".into(),
+                identity_id: Some("b".into()),
+                name: None,
+            },
+            OwnedAddress {
+                email: "julian@kampong.social".into(),
+                identity_id: Some("l".into()),
+                name: None,
+            },
+            OwnedAddress {
+                email: "julian@lindner.earth".into(),
+                identity_id: None,
+                name: None,
+            },
+        ];
+        let (from, id) = choose_from_address(
+            &owned,
+            None,
+            &["julian@lindner.earth".to_owned()],
+            Some("julian@kampong.social"),
+        )
+        .expect("inbound To is preferred");
+        assert_eq!(from, "julian@lindner.earth");
+        assert_eq!(id, "l");
+    }
+
+    /// A role address is refused as an explicit From even when it is a real,
+    /// fully-fledged identity on the account.
+    #[test]
+    fn role_address_is_refused_even_though_it_is_a_real_identity() {
+        let owned = vec![
+            OwnedAddress {
+                email: "team@kampong.social".into(),
+                identity_id: Some("b".into()),
+                name: None,
+            },
+            OwnedAddress {
+                email: "julian@kampong.social".into(),
+                identity_id: Some("l".into()),
+                name: None,
+            },
+        ];
+        for role in [
+            "team@kampong.social",
+            "TEAM@kampong.social",
+            "  team@kampong.social  ",
+        ] {
+            let err = choose_from_address(&owned, Some(role), &[], Some("julian@kampong.social"))
+                .expect_err("role addresses are never a personal From");
+            assert!(
+                err.message.contains("shared role address"),
+                "unexpected message: {}",
+                err.message
+            );
+        }
+    }
+
+    /// A role address must not be reachable implicitly either — not via the
+    /// inbound To of a reply, nor as the signed-in user.
+    #[test]
+    fn role_address_is_never_chosen_implicitly() {
+        let owned = vec![OwnedAddress {
+            email: "team@kampong.social".into(),
+            identity_id: Some("b".into()),
+            name: None,
+        }];
+        assert!(
+            choose_from_address(
+                &owned,
+                None,
+                &["team@kampong.social".to_owned()],
+                Some("team@kampong.social"),
+            )
+            .is_err(),
+            "a role address is not a fallback From"
+        );
     }
 
     #[test]

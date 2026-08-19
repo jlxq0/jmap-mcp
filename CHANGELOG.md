@@ -2,6 +2,36 @@
 
 All notable changes are recorded here. The project uses semantic version tags.
 
+## 0.2.12 — 2026-08-19
+
+### Fixed
+
+- Expose the mailbox's own aliases as sendable From-addresses. `get_identities`
+  returned only the 11 JMAP identities — 9 of them role addresses — and omitted
+  personal aliases such as `julian@lindner.earth`, which made them unusable in
+  `send_email` and `reply_email`. Two independent causes:
+  - `aliases` was parsed as an object map; Stalwart's schema declares it a
+    list, so alias expansion silently produced nothing.
+  - `x:Account/query` and `x:Account/get` require the `sysAccountQuery` and
+    `sysAccountGet` permissions, which an ordinary user's token does not carry,
+    so discovery always degraded to identities-only.
+- Add `JMAP_MCP_EXTRA_FROM_ADDRESSES` so an operator can declare the mailbox's
+  sendable aliases without granting jmap-mcp administrative rights over the
+  mail server. Creates no mailbox and no identity; submission borrows the
+  personal identity while `From` carries the alias.
+- Refuse role addresses (`team@`, `postmaster@`, …) as a personal `From` at
+  configuration-parse time as well as at send time.
+- Log the optional-capability fallback at `warn` instead of `debug`; at `info`
+  log level the permanent degradation was invisible.
+
+### Changed
+
+- Stop hardcoding `APP_VERSION` in the Dockerfile and public CI; the scan image
+  now takes its version from `Cargo.toml`, and the Dockerfile default is an
+  explicit `0.0.0-dev` placeholder.
+- Update README, `compose.yaml`, and the SECURITY supported-version table,
+  which still instructed users to deploy 0.2.10.
+
 ## 0.2.11 — 2026-08-19
 
 ### Fixed
