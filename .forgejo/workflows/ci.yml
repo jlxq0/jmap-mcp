@@ -134,7 +134,7 @@ jobs:
             PUSH=true
             IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
             EXPORT_CACHE_ARG=(--export-cache "type=registry,ref=${CACHE_REF},mode=max")
-            ATTEST_ARGS=(--attest "type=sbom" --attest "type=provenance,mode=max")
+            ATTEST_ARGS=(--opt "attest:sbom=" --opt "attest:provenance=mode=max")
           elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
             TAGS="forge.oddie.app/jlxq0/jmap-mcp:ci-${GITHUB_SHA::8}"
             PUSH=false
