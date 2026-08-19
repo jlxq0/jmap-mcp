@@ -29,7 +29,7 @@ pub const CAP_SUBMISSION: &str = "urn:ietf:params:jmap:submission";
 /// on our pinned Rust 1.93 toolchain.
 #[allow(clippy::duration_suboptimal_units)]
 const SESSION_TTL: Duration = Duration::from_secs(3600);
-const SESSION_SOFT_CAP: usize = 256;
+const SESSION_CAP: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum JmapError {
@@ -351,8 +351,17 @@ impl JmapClient {
         let Ok(mut g) = self.sessions.write() else {
             return;
         };
-        if g.len() >= SESSION_SOFT_CAP {
+        if g.len() >= SESSION_CAP {
             g.retain(|_, c| c.cached_at.elapsed() < SESSION_TTL);
+        }
+        if g.len() >= SESSION_CAP
+            && !g.contains_key(&key)
+            && let Some(oldest) = g
+                .iter()
+                .max_by_key(|(_, cached)| cached.cached_at.elapsed())
+                .map(|(key, _)| *key)
+        {
+            g.remove(&oldest);
         }
         g.insert(
             key,
@@ -442,6 +451,18 @@ mod tests {
     fn url_escape_leaves_unreserved() {
         assert_eq!(url_escape("abc-1.2_3~"), "abc-1.2_3~");
         assert_eq!(url_escape("a/b c"), "a%2Fb%20c");
+    }
+
+    #[test]
+    fn session_cache_is_hard_capped() {
+        let client = JmapClient::new("https://mail.example.test", None).unwrap();
+        let session: JmapSession = serde_json::from_value(session_body()).unwrap();
+        for i in 0..=SESSION_CAP {
+            let mut key = [0_u8; 32];
+            key[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            client.session_insert(key, &session);
+        }
+        assert_eq!(client.sessions.read().unwrap().len(), SESSION_CAP);
     }
 
     // ----- session discovery against a mock Stalwart -----

@@ -1,9 +1,7 @@
 //! Public-only URL fetch validation (SSRF defence).
 //!
-//! [`MatrixMcpService::upload_from_url`] (and its callers
-//! `send_image_from_url`, `send_file`/`_audio`/`_video`,
-//! `me_set_avatar`, `upload_media_from_url`) fetch caller-supplied URLs
-//! from the jmap-mcp pod's network position. Without validation, an
+//! The URL attachment tools fetch caller-supplied URLs from the jmap-mcp
+//! pod's network position. Without validation, an
 //! authenticated MCP caller could ask jmap-mcp to issue GETs against
 //! anything the pod can reach — RFC1918 / loopback / link-local / cloud
 //! metadata endpoints — and either exfiltrate the body (when the
@@ -14,17 +12,15 @@
 //!
 //! 1. Resolve the URL's host via standard `tokio::net::lookup_host`.
 //! 2. Reject if **any** resolved IP is non-publicly-routable.
-//! 3. Disable reqwest's automatic redirect handling and re-run the
-//!    same check on each `Location` target before following.
+//! 3. Pin the validated addresses into the one-off reqwest client so DNS is
+//!    not resolved again between validation and connection.
+//! 4. Disable reqwest's automatic redirect handling. Callers currently reject
+//!    redirects rather than following them.
 //!
-//! Steps (1) + (3) close the gap where an attacker controls an HTTPS
-//! server that 30x-redirects to `http://10.0.0.1/...` or even
-//! `http://169.254.169.254/latest/meta-data/`.
+//! Address pinning closes DNS rebinding, while rejecting redirects prevents a
+//! public server from redirecting the fetch to a private or metadata address.
 //!
-//! No DNS pinning between steps: we resolve fresh each time, which
-//! is fine because we revalidate each result against the denylist.
-
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use anyhow::Result;
 use tokio::net::lookup_host;
@@ -49,6 +45,13 @@ pub fn is_private_or_local_ip(ip: IpAddr) -> bool {
                 || v4.is_multicast()
                 // CGNAT (100.64.0.0/10) — used by Tailscale and similar.
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 0b0100_0000)
+                // 0.0.0.0/8 (current network), 198.18.0.0/15 (benchmarking),
+                // and 240.0.0.0/4 (reserved) are not globally reachable.
+                || v4.octets()[0] == 0
+                || (v4.octets()[0] == 198 && (v4.octets()[1] & 0xfe) == 18)
+                || v4.octets()[0] >= 240
+                // Deprecated 6to4 relay anycast range.
+                || (v4.octets()[0..3] == [192, 88, 99])
         }
         IpAddr::V6(v6) => {
             v6.is_loopback()
@@ -82,7 +85,7 @@ pub fn is_private_or_local_ip(ip: IpAddr) -> bool {
 /// We reject the whole URL when *any* resolved IP is private, not just
 /// one — DNS rebinding could otherwise let an attacker swap a public
 /// IP for a private one between checks.
-pub async fn assert_public_host(host: &str, port: u16) -> Result<()> {
+pub async fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     let addrs: Vec<_> = lookup_host((host, port))
         .await
         .map_err(|e| anyhow::anyhow!("DNS lookup for {host}:{port} failed: {e}"))?
@@ -98,13 +101,50 @@ pub async fn assert_public_host(host: &str, port: u16) -> Result<()> {
             );
         }
     }
-    Ok(())
+    Ok(addrs)
+}
+
+/// An HTTPS URL paired with the exact public socket addresses that passed the
+/// SSRF check. Fetchers must use both together to avoid DNS rebinding.
+#[derive(Debug, Clone)]
+pub struct ValidatedHttpsUrl {
+    url: reqwest::Url,
+    host: String,
+    resolved_addrs: Vec<SocketAddr>,
+    host_is_domain: bool,
+}
+
+impl std::fmt::Display for ValidatedHttpsUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl ValidatedHttpsUrl {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.url.as_str()
+    }
+
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    #[must_use]
+    pub fn resolved_addrs(&self) -> &[SocketAddr] {
+        &self.resolved_addrs
+    }
+
+    #[must_use]
+    pub const fn host_is_domain(&self) -> bool {
+        self.host_is_domain
+    }
 }
 
 /// Parse an absolute HTTPS URL and assert its host resolves to a public
-/// IP. Used as the pre-fetch and post-redirect check in
-/// [`MatrixMcpService::upload_from_url`].
-pub async fn validate_https_url(url: &str) -> Result<()> {
+/// IP and retain those exact addresses for the subsequent fetch.
+pub async fn validate_https_url(url: &str) -> Result<ValidatedHttpsUrl> {
     if !url.starts_with("https://") {
         anyhow::bail!(
             "url must be HTTPS (http:// is rejected to prevent credential exposure over cleartext)"
@@ -117,9 +157,17 @@ pub async fn validate_https_url(url: &str) -> Result<()> {
         reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("failed to parse URL {url}: {e}"))?;
     let host = parsed
         .host_str()
-        .ok_or_else(|| anyhow::anyhow!("URL {url} has no host"))?;
+        .ok_or_else(|| anyhow::anyhow!("URL {url} has no host"))?
+        .to_owned();
+    let host_is_domain = matches!(parsed.host(), Some(url::Host::Domain(_)));
     let port = parsed.port_or_known_default().unwrap_or(443);
-    assert_public_host(host, port).await
+    let resolved_addrs = resolve_public_host(&host, port).await?;
+    Ok(ValidatedHttpsUrl {
+        url: parsed,
+        host,
+        resolved_addrs,
+        host_is_domain,
+    })
 }
 
 #[cfg(test)]
@@ -165,6 +213,18 @@ mod tests {
         assert!(!is_private_or_local_ip(IpAddr::V4(Ipv4Addr::new(
             100, 63, 0, 1
         ))));
+    }
+
+    #[test]
+    fn ipv4_benchmark_and_reserved_ranges_are_blocked() {
+        for ip in [
+            Ipv4Addr::new(0, 1, 2, 3),
+            Ipv4Addr::new(198, 18, 0, 1),
+            Ipv4Addr::new(198, 19, 255, 254),
+            Ipv4Addr::new(240, 0, 0, 1),
+        ] {
+            assert!(is_private_or_local_ip(IpAddr::V4(ip)), "{ip}");
+        }
     }
 
     #[test]
@@ -235,5 +295,16 @@ mod tests {
     async fn validate_rejects_rfc1918_literal() {
         let err = validate_https_url("https://10.0.0.1/x").await.unwrap_err();
         assert!(err.to_string().contains("10.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn validated_url_carries_the_checked_socket_address() {
+        let validated = validate_https_url("https://1.1.1.1/resource")
+            .await
+            .unwrap();
+        assert_eq!(validated.as_str(), "https://1.1.1.1/resource");
+        assert!(!validated.host_is_domain());
+        assert_eq!(validated.resolved_addrs().len(), 1);
+        assert_eq!(validated.resolved_addrs()[0].ip().to_string(), "1.1.1.1");
     }
 }

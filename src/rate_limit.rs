@@ -25,11 +25,9 @@
 //!
 //! ## Memory bound
 //!
-//! Buckets are retained for the lifetime of the process; map growth is
-//! bounded by the number of distinct bearer hashes + MAS subjects, which
-//! is small for jmap-mcp's threat model (single tenant today, dozens
-//! long-term). Token rotation may churn a handful of extra entries, but
-//! each bucket is only a few hundred bytes — no eviction needed.
+//! Each bucket map is hard-capped with least-recently-seen eviction. This
+//! keeps valid-token rotation or a growing tenant population from turning
+//! authentication churn into permanent process-memory growth.
 //!
 //! ## Quota knobs
 //!
@@ -42,7 +40,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
@@ -79,6 +77,19 @@ pub const INITIALIZE_REFILL_INTERVAL: Duration = Duration::from_secs(60);
 /// build one per identity and hand it out keyed by bearer-hash or sub.
 type Bucket = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
+/// Hard memory bound for each rate-limit key map. This is deliberately much
+/// larger than the expected tenant population while preventing valid-token
+/// churn from growing the process forever.
+const LIMITER_KEY_CAP: usize = 4096;
+
+#[derive(Debug)]
+struct BucketEntry {
+    bucket: Arc<Bucket>,
+    last_seen: Instant,
+}
+
+type BucketMap = RwLock<HashMap<String, BucketEntry>>;
+
 /// What kind of MCP tool this call is. Drives which quota applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
@@ -94,10 +105,10 @@ pub struct RateLimited;
 pub struct Limiter {
     reads_per_min: NonZeroU32,
     writes_per_min: NonZeroU32,
-    bearer_read: RwLock<HashMap<String, Arc<Bucket>>>,
-    bearer_write: RwLock<HashMap<String, Arc<Bucket>>>,
-    sub_read: RwLock<HashMap<String, Arc<Bucket>>>,
-    sub_write: RwLock<HashMap<String, Arc<Bucket>>>,
+    bearer_read: BucketMap,
+    bearer_write: BucketMap,
+    sub_read: BucketMap,
+    sub_write: BucketMap,
 }
 
 impl Limiter {
@@ -142,28 +153,13 @@ impl Limiter {
     }
 }
 
-fn get_or_insert(
-    map: &RwLock<HashMap<String, Arc<Bucket>>>,
-    key: &str,
-    quota: NonZeroU32,
-) -> Arc<Bucket> {
+fn get_or_insert(map: &BucketMap, key: &str, quota: NonZeroU32) -> Arc<Bucket> {
     // `governor::Quota::per_minute(n)` translates to one token every
     // (60/n) seconds with a burst of `n`.
     get_or_insert_with_quota(map, key, Quota::per_minute(quota))
 }
 
-fn get_or_insert_with_quota(
-    map: &RwLock<HashMap<String, Arc<Bucket>>>,
-    key: &str,
-    quota: Quota,
-) -> Arc<Bucket> {
-    if let Ok(guard) = map.read()
-        && let Some(b) = guard.get(key)
-    {
-        return Arc::clone(b);
-    }
-    // Slow path: re-check under write lock to avoid double-insert under
-    // contention.
+fn get_or_insert_with_quota(map: &BucketMap, key: &str, quota: Quota) -> Arc<Bucket> {
     let mut guard = match map.write() {
         Ok(g) => g,
         // RwLock poisoning is unrecoverable here. A poisoned lock means a
@@ -173,11 +169,28 @@ fn get_or_insert_with_quota(
         // upstream via tracing in the call site if it ever fires.
         Err(p) => p.into_inner(),
     };
-    Arc::clone(
-        guard
-            .entry(key.to_owned())
-            .or_insert_with(|| Arc::new(RateLimiter::direct(quota))),
-    )
+    let now = Instant::now();
+    if let Some(entry) = guard.get_mut(key) {
+        entry.last_seen = now;
+        return Arc::clone(&entry.bucket);
+    }
+    if guard.len() >= LIMITER_KEY_CAP
+        && let Some(oldest) = guard
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_seen)
+            .map(|(key, _)| key.clone())
+    {
+        guard.remove(&oldest);
+    }
+    let bucket = Arc::new(RateLimiter::direct(quota));
+    guard.insert(
+        key.to_owned(),
+        BucketEntry {
+            bucket: Arc::clone(&bucket),
+            last_seen: now,
+        },
+    );
+    bucket
 }
 
 /// Rate limiter dedicated to fresh MCP session creation (the
@@ -193,8 +206,8 @@ fn get_or_insert_with_quota(
 #[derive(Debug)]
 pub struct InitializeLimiter {
     quota: Quota,
-    bearer: RwLock<HashMap<String, Arc<Bucket>>>,
-    sub: RwLock<HashMap<String, Arc<Bucket>>>,
+    bearer: BucketMap,
+    sub: BucketMap,
 }
 
 impl InitializeLimiter {
@@ -309,5 +322,21 @@ mod tests {
         assert!(l.check("h", None).is_err());
         // Different bearer → fresh bucket.
         l.check("h2", None).unwrap();
+    }
+
+    #[test]
+    fn limiter_key_maps_are_hard_capped() {
+        let l = Limiter::new(100_000, 100_000).unwrap();
+        for i in 0..=LIMITER_KEY_CAP {
+            l.check(&format!("bearer-{i}"), None, Category::Read)
+                .unwrap();
+        }
+        assert_eq!(l.bearer_read.read().unwrap().len(), LIMITER_KEY_CAP);
+
+        let initialize = InitializeLimiter::new(Duration::from_secs(60), 1);
+        for i in 0..=LIMITER_KEY_CAP {
+            initialize.check(&format!("bearer-{i}"), None).unwrap();
+        }
+        assert_eq!(initialize.bearer.read().unwrap().len(), LIMITER_KEY_CAP);
     }
 }

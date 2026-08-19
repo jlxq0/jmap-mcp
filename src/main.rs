@@ -36,6 +36,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::net::TcpListener;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -46,6 +47,11 @@ use crate::logto_oidc::LogtoValidationClient;
 use crate::mcp::JmapMcpService;
 use crate::oauth_metadata::{authorization_server_metadata, protected_resource_metadata, register};
 use crate::rate_limit::{InitializeLimiter, Limiter, MAX_INITIALIZES_PER_IDENTITY};
+
+/// MCP JSON-RPC requests are small; cap the transport body before rmcp
+/// collects it into memory. Four MiB leaves ample room for batched tool
+/// arguments while preventing a valid bearer from exhausting the process.
+const MCP_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -147,6 +153,7 @@ fn build_router(
             auth_state.clone(),
             bearer_auth,
         ))
+        .layer(RequestBodyLimitLayer::new(MCP_MAX_REQUEST_BYTES))
         .with_state(auth_state);
 
     Router::new()
@@ -393,6 +400,23 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(www.contains("oauth-protected-resource/mcp"));
+    }
+
+    #[tokio::test]
+    async fn oversized_mcp_body_is_rejected_before_collection() {
+        let app = router(test_config());
+        let r = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::CONTENT_LENGTH, MCP_MAX_REQUEST_BYTES + 1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     /// A throttled initialize must be machine-readable: JSON-RPC body so the

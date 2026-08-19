@@ -10,6 +10,39 @@ use super::*;
 /// JMAP vacation-response capability URN (RFC 8621 §8).
 const CAP_VACATION: &str = "urn:ietf:params:jmap:vacationresponse";
 
+fn select_profile_identity(list: &[Value], preferred_email: Option<&str>) -> Option<Value> {
+    preferred_email
+        .and_then(|email| {
+            list.iter().find(|identity| {
+                str_field(identity, "email")
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(email))
+            })
+        })
+        .or_else(|| {
+            list.iter().find(|identity| {
+                str_field(identity, "email").is_some_and(|email| !is_role_address(&email))
+            })
+        })
+        .or_else(|| list.first())
+        .cloned()
+}
+
+fn vacation_capability_unsupported(error: &JmapError) -> bool {
+    matches!(
+        error,
+        JmapError::Method { error_type, .. }
+            if error_type == "unknownMethod" || error_type == "unknownCapability"
+    )
+}
+
+fn map_vacation_set_error(error: JmapError) -> ErrorData {
+    if vacation_capability_unsupported(&error) {
+        ErrorData::invalid_params("vacation response not supported", None)
+    } else {
+        map_jmap_err(error)
+    }
+}
+
 // ----- result + parameter types -----
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -231,6 +264,12 @@ impl JmapMcpService {
             self.rate_limit_check(&ctx, Category::Read)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
             let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let session_email = self
+                .jmap
+                .session_for(&token.0)
+                .await
+                .map_err(map_jmap_err)?
+                .username;
             let resps = self
                 .jmap
                 .call(
@@ -244,14 +283,15 @@ impl JmapMcpService {
                 )
                 .await
                 .map_err(map_jmap_err)?;
-            let identity = resps
+            let identities = resps
                 .into_iter()
                 .find(|(n, _, _)| n == "Identity/get")
-                .and_then(|(_, p, _)| {
-                    p.get("list")
-                        .and_then(Value::as_array)
-                        .and_then(|a| a.first().cloned())
-                });
+                .and_then(|(_, p, _)| p.get("list").and_then(Value::as_array).cloned())
+                .unwrap_or_default();
+            let preferred_email = identity_from_ctx(&ctx)
+                .and_then(|identity| identity.email)
+                .or(session_email);
+            let identity = select_profile_identity(&identities, preferred_email.as_deref());
             structured_result(&GetProfileResult {
                 email: identity.as_ref().and_then(|i| str_field(i, "email")),
                 name: identity.as_ref().and_then(|i| str_field(i, "name")),
@@ -288,7 +328,7 @@ impl JmapMcpService {
             self.rate_limit_check(&ctx, Category::Read)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
             let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
-            let resps = self
+            let resps = match self
                 .jmap
                 .call(
                     &token.0,
@@ -299,17 +339,19 @@ impl JmapMcpService {
                         "v",
                     )],
                 )
-                .await;
-            // Capability absent (or any method error) → report unsupported
-            // rather than failing the call.
-            let Ok(resps) = resps else {
-                return structured_result(&VacationResponseResult {
-                    enabled: false,
-                    message: None,
-                    from_date: None,
-                    to_date: None,
-                    supported: false,
-                });
+                .await
+            {
+                Ok(resps) => resps,
+                Err(error) if vacation_capability_unsupported(&error) => {
+                    return structured_result(&VacationResponseResult {
+                        enabled: false,
+                        message: None,
+                        from_date: None,
+                        to_date: None,
+                        supported: false,
+                    });
+                }
+                Err(error) => return Err(map_jmap_err(error)),
             };
             let vacation = resps
                 .into_iter()
@@ -397,16 +439,30 @@ impl JmapMcpService {
                     )],
                 )
                 .await
-                .map_err(|_| ErrorData::invalid_params("vacation response not supported", None))?;
-            let updated = resps
+                .map_err(map_vacation_set_error)?;
+            let response = resps
                 .iter()
                 .find(|(n, _, _)| n == "VacationResponse/set")
-                .and_then(|(_, p, _)| p.get("updated"))
+                .map(|(_, payload, _)| payload)
+                .ok_or_else(|| {
+                    ErrorData::internal_error("missing VacationResponse/set response", None)
+                })?;
+            let updated = response
+                .get("updated")
                 .and_then(Value::as_object)
                 .is_some_and(|o| o.contains_key("singleton"));
             if !updated {
-                return Err(ErrorData::invalid_params(
-                    "vacation response not supported",
+                if let Some(failure) = response.get("notUpdated").and_then(|v| v.get("singleton")) {
+                    let reason = failure
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .or_else(|| failure.get("type").and_then(Value::as_str))
+                        .unwrap_or("vacation response update was rejected")
+                        .to_owned();
+                    return Err(ErrorData::invalid_params(reason, None));
+                }
+                return Err(ErrorData::internal_error(
+                    "vacation response was neither updated nor rejected",
                     None,
                 ));
             }
@@ -641,6 +697,30 @@ fn is_plausible_address(email: &str) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_identity_prefers_signed_in_address_over_list_order() {
+        let identities = vec![
+            json!({"email": "team@kampong.social", "name": "Team"}),
+            json!({"email": "julian@kampong.social", "name": "Julian"}),
+        ];
+        let selected = select_profile_identity(&identities, Some("julian@kampong.social")).unwrap();
+        assert_eq!(
+            str_field(&selected, "email").as_deref(),
+            Some("julian@kampong.social")
+        );
+    }
+
+    #[test]
+    fn vacation_transport_and_auth_errors_are_not_reported_as_unsupported() {
+        assert!(vacation_capability_unsupported(&JmapError::Method {
+            error_type: "unknownMethod".to_owned(),
+            description: None,
+        }));
+        assert!(!vacation_capability_unsupported(&JmapError::Unauthorized));
+        let mapped = map_vacation_set_error(JmapError::Unauthorized);
+        assert_eq!(mapped.code.0, audit::AUTH_EXPIRED_CODE);
+    }
 
     #[test]
     fn plausible_addresses_accepted() {

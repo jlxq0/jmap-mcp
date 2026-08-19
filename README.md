@@ -19,7 +19,7 @@ no per-user store, no PVC).
 
 ## What you get
 
-46 tools, all carrying MCP annotations (`read_only_hint`,
+47 tools, all carrying MCP annotations (`read_only_hint`,
 `destructive_hint`, `idempotent_hint`) so client UIs can auto-approve reads
 and warn before writes.
 
