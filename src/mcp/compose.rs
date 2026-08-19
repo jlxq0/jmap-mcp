@@ -626,10 +626,26 @@ impl JmapMcpService {
 
             let to_addrs: Vec<Value> = params.to.iter().map(|e| json!({ "email": e })).collect();
 
+            // Validate the From exactly as `update_draft` and the send paths
+            // do. Writing `params.from` through unchecked let a draft be
+            // composed from a shared role address, or from an address this
+            // mailbox does not own at all — and a draft is one click away from
+            // being sent by a human in a mail client.
+            let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
+            let (from_addr, _) = self
+                .resolve_submission_identity(
+                    &token.0,
+                    &account_id,
+                    Some(&params.from),
+                    &[],
+                    session_email.as_deref(),
+                )
+                .await?;
+
             let mut email_obj = json!({
                 "mailboxIds": { drafts: true },
                 "keywords": { "$draft": true, "$seen": true },
-                "from": [ { "email": params.from } ],
+                "from": [ { "email": from_addr } ],
                 "to": to_addrs,
                 "subject": params.subject,
                 "bodyValues": { "b": { "value": params.body, "isTruncated": false } },

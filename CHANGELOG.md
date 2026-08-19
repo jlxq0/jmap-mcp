@@ -2,6 +2,16 @@
 
 All notable changes are recorded here. The project uses semantic version tags.
 
+## 0.2.13 — 2026-08-19
+
+### Fixed
+
+- `save_draft` wrote its `from` parameter into the draft unchecked. It was the
+  only compose path that skipped `resolve_submission_identity`, so a draft
+  could be composed from a shared role address, or from an address the mailbox
+  does not own — one click from being sent by a human in a mail client. It now
+  validates identically to `update_draft`, `reply_email`, and `send_email`.
+
 ## 0.2.12 — 2026-08-19
 
 ### Fixed
