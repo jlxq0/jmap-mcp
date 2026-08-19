@@ -32,6 +32,7 @@ jobs:
       # before changing it.
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable
         with:
+          toolchain: 1.93.0
           components: rustfmt, clippy
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
@@ -50,9 +51,9 @@ jobs:
         run: cargo test --all-features --locked
       - name: audit
         run: |
-          [ -x ~/.cargo/bin/cargo-audit ] || cargo install --locked cargo-audit
+          [ -x ~/.cargo/bin/cargo-audit ] || cargo install --locked cargo-audit --version 0.22.1
           cargo audit
-      - uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1  # v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # v2.1.1
         with: { command: check bans licenses sources }
 
   # buildctl talks to Pada's buildkitd over TCP. Registry-backed layer cache.
@@ -76,6 +77,21 @@ jobs:
           sudo tar -xz -C /usr/local --strip-components=0 -f "$TARBALL"
           rm -f "$TARBALL"
           buildctl --version
+      - name: Install Trivy
+        env:
+          TRIVY_VERSION: 0.74.0
+          TRIVY_SHA256: 2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a
+        run: |
+          set -euo pipefail
+          TARBALL="/tmp/trivy.tar.gz"
+          curl -sSL -o "$TARBALL" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  ${TARBALL}" | sha256sum -c -
+          sudo tar -xz -C /usr/local/bin -f "$TARBALL" trivy
+          rm -f "$TARBALL"
+          trivy --version
+      - name: Scan source tree
+        run: trivy fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 .
       - name: Login to Forgejo registry
         if: github.event_name != 'pull_request'
         run: |
@@ -94,14 +110,19 @@ jobs:
           export BUILDKIT_HOST="tcp://${GW}:1234"
           echo "buildkitd at ${BUILDKIT_HOST}"
           CACHE_REF="forge.oddie.app/jlxq0/jmap-mcp:buildcache"
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          METADATA_FILE="/tmp/build-metadata.json"
           IMPORT_CACHE_ARG=()
           EXPORT_CACHE_ARG=()
+          ATTEST_ARGS=()
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             V="${GITHUB_REF#refs/tags/}"
+            test "${V#v}" = "$VERSION"
             TAGS="forge.oddie.app/jlxq0/jmap-mcp:${V},forge.oddie.app/jlxq0/jmap-mcp:latest"
             PUSH=true
             IMPORT_CACHE_ARG=(--import-cache "type=registry,ref=${CACHE_REF}")
             EXPORT_CACHE_ARG=(--export-cache "type=registry,ref=${CACHE_REF},mode=max")
+            ATTEST_ARGS=(--attest "type=sbom" --attest "type=provenance,mode=max")
           elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
             TAGS="forge.oddie.app/jlxq0/jmap-mcp:ci-${GITHUB_SHA::8}"
             PUSH=false
@@ -115,6 +136,21 @@ jobs:
             --frontend dockerfile.v0 \
             --local context=. \
             --local dockerfile=. \
+            --opt platform=linux/amd64 \
+            --opt "build-arg:APP_VERSION=${VERSION}" \
+            --opt "build-arg:VCS_REF=${GITHUB_SHA}" \
+            --metadata-file "$METADATA_FILE" \
             "${IMPORT_CACHE_ARG[@]}" \
             "${EXPORT_CACHE_ARG[@]}" \
+            "${ATTEST_ARGS[@]}" \
             --output "type=image,\"name=${TAGS}\",push=${PUSH}"
+
+          if [[ "$PUSH" == true ]]; then
+            DIGEST="$(jq -r '."containerimage.digest"' "$METADATA_FILE")"
+            test -n "$DIGEST" && test "$DIGEST" != null
+            trivy image \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --exit-code 1 \
+              "forge.oddie.app/jlxq0/jmap-mcp@${DIGEST}"
+          fi

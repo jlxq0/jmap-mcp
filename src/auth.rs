@@ -1,5 +1,6 @@
 //! Axum middleware: extract the `Authorization: Bearer <token>` header,
-//! validate it against Logto (JWKS + RS256), and attach the resulting
+//! validate it against Logto (JWKS plus an asymmetric-algorithm allowlist),
+//! and attach the resulting
 //! `AuthenticatedIdentity` + raw `AccessToken` to the request extensions so
 //! downstream handlers (and the rmcp tool layer) can read them.
 

@@ -30,10 +30,14 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
 
 ## CI / deploy
 
-- Forgejo Actions (`.forgejo/workflows/ci.yml`). The docker job derives
-  `BUILDKIT_HOST` from the container's own default gateway at runtime — never
-  hardcode the runner IP. Release path: push tag `vX.Y.Z` → CI builds + pushes
-  `forge.oddie.app/jlxq0/jmap-mcp:vX.Y.Z`.
-- Live deploy is **kubectl-applied** (namespace `jmap-mcp-www`), not yet argocd.
-  Roll a new version: `kubectl -n jmap-mcp-www set image deploy/jmap-mcp-www
-  app=forge.oddie.app/jlxq0/jmap-mcp:vX.Y.Z`.
+- Forgejo Actions (`.forgejo/workflows/ci.yml`) build and scan the
+  `linux/amd64` image, attach SBOM/provenance attestations, and publish
+  `forge.oddie.app/jlxq0/jmap-mcp:vX.Y.Z` for a matching version tag.
+- GitHub Actions (`.github/workflows/`) run equivalent public CI and publish a
+  keylessly signed `ghcr.io/jlxq0/jmap-mcp:X.Y.Z` image plus an SPDX SBOM.
+- Live deployment is GitOps-managed by ArgoCD on **Fondue**, namespace
+  `jmap-mcp`. The manifest is
+  `/Users/jl/Code/oddie-apps/platform/clusters/fondue/jmap-mcp/deployment.yaml`
+  and images are pinned by tag **and digest**. Never use `kubectl set image`;
+  update the platform repository and wait for the `jmap-mcp` Argo application
+  to report `Synced` and `Healthy`.

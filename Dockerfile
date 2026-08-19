@@ -24,7 +24,17 @@ RUN cargo build --release --locked
 
 # Distroless runtime: no shell, no apt. `cc` variant ships glibc + ca-certs,
 # which we need for HTTPS to Logto (JWKS) and Stalwart (JMAP).
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:e2d29aec8061843706b7e484c444f78fafb05bfe47745505252b1769a05d14f1
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77
+
+ARG APP_VERSION=0.2.10
+ARG VCS_REF=unknown
+
+LABEL org.opencontainers.image.title="jmap-mcp" \
+      org.opencontainers.image.description="Remote MCP server exposing a Stalwart JMAP mailbox" \
+      org.opencontainers.image.source="https://github.com/jlxq0/jmap-mcp" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}"
 
 WORKDIR /app
 COPY --from=builder /build/target/release/jmap-mcp /app/jmap-mcp

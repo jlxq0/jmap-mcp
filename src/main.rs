@@ -1,7 +1,8 @@
 //! `jmap-mcp` — Remote MCP server exposing a Stalwart JMAP mailbox to
 //! claude.ai. Ported from `matrix-mcp`.
 //!
-//! Inbound requests are authenticated against Logto (JWKS + RS256); the
+//! Inbound requests are authenticated against Logto (JWKS plus an allowlist
+//! of asymmetric signing algorithms); the
 //! validated bearer is forwarded verbatim to Stalwart on every JMAP call.
 //! Stateless: no per-user store, no E2EE, no PVC.
 
@@ -27,13 +28,13 @@ mod url_safety;
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
+use axum::{Json, Router};
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::net::TcpListener;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -198,7 +199,10 @@ fn build_router(
 }
 
 async fn health() -> impl IntoResponse {
-    (StatusCode::OK, "ok\n")
+    Json(serde_json::json!({
+        "status": "healthy",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 /// Rejects fresh MCP session creation when the caller's per-identity
@@ -377,6 +381,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            r.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["status"], "healthy");
+        assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[tokio::test]

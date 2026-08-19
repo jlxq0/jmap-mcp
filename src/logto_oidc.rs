@@ -1,4 +1,4 @@
-//! Logto access-token validation via JWKS + RS256.
+//! Logto access-token validation via JWKS and allowlisted asymmetric algorithms.
 //!
 //! Unlike matrix-mcp (which introspected every bearer against MAS over the
 //! network), jmap-mcp validates Logto access tokens *locally*: fetch the
