@@ -28,6 +28,22 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   redirect URI policy once the transparent proxy rewrites `redirect_uri`.
   Found 2026-06: authorization-code theft via attacker-controlled callback.
 
+- **A JSON shape asserted only against a hand-written fixture is not tested.**
+  `aliases_of` read Stalwart's `aliases` as an object map; the real schema is a
+  **list**, so `as_object()` returned `None` and the mailbox's aliases silently
+  vanished — while the unit test passed, because the fixture was a map too. The
+  tool reported `outcome=ok` with a plausible count throughout. When a fixture
+  encodes an external API's shape, cite the vendor schema in the test, and
+  accept both shapes when the cost is a two-arm match.
+
+- **Optional-capability fallbacks must be logged at least at `warn`.**
+  Principal alias discovery degraded to identities-only at `debug`, and prod
+  runs at `info`, so the permanent failure was invisible for two releases.
+  `x:Account/query` and `x:Account/get` need `sysAccountQuery`/`sysAccountGet`,
+  which an ordinary user token never has, so that path always degrades — the
+  addresses users send as come from `JMAP_MCP_EXTRA_FROM_ADDRESSES` instead. A
+  fallback that is expected to fire still has to say so. Found 2026-08.
+
 ## CI / deploy
 
 - Forgejo Actions (`.forgejo/workflows/ci.yml`) build and scan the

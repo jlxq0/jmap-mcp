@@ -123,6 +123,7 @@ fn build_router(
         allowed_hosts.push(h);
     }
     let audit_registry = audit_mailbox::AuditMailboxRegistry::new();
+    let extra_from_addresses = Arc::new(cfg.extra_from_addresses.clone());
     let mcp_service = StreamableHttpService::new(
         move || {
             Ok(JmapMcpService::new(
@@ -132,6 +133,7 @@ fn build_router(
                 download_max_bytes,
                 upload_max_bytes,
                 audit_registry.clone(),
+                Arc::clone(&extra_from_addresses),
             ))
         },
         Arc::new(session::CappedSessionManager::new()),

@@ -30,7 +30,10 @@ RUN cargo build --release --locked
 # which we need for HTTPS to Logto (JWKS) and Stalwart (JMAP).
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77
 
-ARG APP_VERSION=0.2.10
+# Release workflows always pass the tag's version. This default is a
+# deliberate placeholder: a stale real version would silently mislabel
+# locally built and CI-scanned images.
+ARG APP_VERSION=0.0.0-dev
 ARG VCS_REF=unknown
 
 LABEL org.opencontainers.image.title="jmap-mcp" \

@@ -57,15 +57,15 @@ curl http://127.0.0.1:3000/health
 The image is published to:
 
 ```text
-ghcr.io/jlxq0/jmap-mcp:0.2.10
-forge.oddie.app/jlxq0/jmap-mcp:v0.2.10
+ghcr.io/jlxq0/jmap-mcp:0.2.12
+forge.oddie.app/jlxq0/jmap-mcp:v0.2.12
 ```
 
 For a direct container invocation:
 
 ```sh
 docker run --rm -p 3000:3000 --env-file .env \
-  ghcr.io/jlxq0/jmap-mcp:0.2.10
+  ghcr.io/jlxq0/jmap-mcp:0.2.12
 ```
 
 Expose port 3000 through HTTPS and configure the MCP client with:
@@ -77,7 +77,7 @@ https://jmap-mcp.your-domain.example/mcp
 `GET /health` is public and returns the running package version:
 
 ```json
-{"status":"healthy","version":"0.2.10"}
+{"status":"healthy","version":"0.2.12"}
 ```
 
 ## Logto and Stalwart setup
@@ -127,6 +127,7 @@ ending in `/mcp`; jmap-mcp canonicalises it to the bare origin and advertises
 | `JMAP_MCP_DOWNLOAD_MAX_BYTES` | no | `5242880` | Maximum attachment download response |
 | `JMAP_MCP_UPLOAD_MAX_BYTES` | no | `10485760` | Maximum remote URL attachment fetch |
 | `JMAP_MCP_TRUSTED_PROXY_HOPS` | no | `1` | Trusted rightmost `X-Forwarded-For` proxy count; use `0` when directly exposed |
+| `JMAP_MCP_EXTRA_FROM_ADDRESSES` | for mailbox aliases | empty | Extra sendable addresses, comma- or whitespace-separated. Stalwart exposes principal aliases only through `x:Account/*`, which need `sysAccountGet`/`sysAccountQuery` permissions an ordinary user token lacks, so aliases must be named here. Role addresses are refused |
 | `JMAP_MCP_STALWART_CONNECT_IP` | no | DNS | Optional fixed Stalwart socket address for private routing while preserving TLS host validation |
 | `JMAP_MCP_LOGTO_CLIENT_ID` | no | — | Opaque-token introspection client ID; must be paired with the secret |
 | `JMAP_MCP_LOGTO_CLIENT_SECRET` | no | — | Opaque-token introspection client secret |
