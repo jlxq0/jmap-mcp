@@ -44,7 +44,7 @@ subtle = "2.6"
 rand = "0.8"
 # Logto access-token validation: allowlisted asymmetric JWT signatures plus
 # aud/exp checks against the JWKS published at {authorization_server}/jwks.
-jsonwebtoken = "9.3"
+jsonwebtoken = "10.3"
 # Official MCP Rust SDK. `transport-streamable-http-server` enables the
 # session manager + http transport we mount via `Router::nest_service`.
 # rmcp re-exports `schemars` (1.x) — we use `rmcp::schemars`, never a
