@@ -280,6 +280,41 @@ pub struct OwnedAddress {
     pub name: Option<String>,
 }
 
+/// The resolved `From` for a submission: which address, under which identity,
+/// and the display name that address carries.
+///
+/// The name is whatever the mailbox already publishes for the address — an
+/// `Identity`'s `name`, or an alias's description. It is never synthesised:
+/// an address with no name on file is sent bare rather than given a guessed
+/// one, because a wrong display name misattributes the message as surely as a
+/// wrong address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChosenFrom {
+    pub email: String,
+    pub name: Option<String>,
+    pub identity_id: String,
+}
+
+impl ChosenFrom {
+    /// A JMAP `EmailAddress` for the `from` header.
+    ///
+    /// JMAP carries the display name unencoded in its own field and leaves
+    /// RFC 5322 quoting and RFC 2047 encoding to the server, so the name is
+    /// passed through verbatim — building a `"Name" <addr>` string here would
+    /// double-encode it. An empty or whitespace-only name is dropped rather
+    /// than emitted as `"" <addr>`.
+    pub fn header(&self) -> Value {
+        self.name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map_or_else(
+                || json!({ "email": self.email }),
+                |name| json!({ "name": name, "email": self.email }),
+            )
+    }
+}
+
 /// Local-parts that denote a shared/role mailbox rather than a person.
 ///
 /// RFC 2142 defines most of these; the rest are conventional shared inboxes
@@ -343,7 +378,7 @@ fn choose_from_address(
     explicit_from: Option<&str>,
     preferred: &[String],
     session_email: Option<&str>,
-) -> Result<(String, String), ErrorData> {
+) -> Result<ChosenFrom, ErrorData> {
     if owned.is_empty() {
         return Err(ErrorData::invalid_params(
             "this account has no sending addresses configured",
@@ -414,7 +449,11 @@ fn choose_from_address(
             )
         })?,
     };
-    Ok((chosen.email, identity_id))
+    Ok(ChosenFrom {
+        email: chosen.email,
+        name: chosen.name,
+        identity_id,
+    })
 }
 
 /// Comma-separated non-role addresses, for error messages.
@@ -1292,7 +1331,7 @@ impl JmapMcpService {
             // address the mailbox owns, including aliases with no Identity
             // object; refuses shared role addresses.
             let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
-            let (from_addr, identity_id) = self
+            let from = self
                 .resolve_submission_identity(
                     &token.0,
                     &account_id,
@@ -1309,7 +1348,7 @@ impl JmapMcpService {
             let mut email_obj = json!({
                 "mailboxIds": { drafts.clone(): true },
                 "keywords": { "$draft": true, "$seen": true },
-                "from": [ { "email": from_addr } ],
+                "from": [ from.header() ],
                 "to": to_addrs,
                 "subject": params.subject,
                 "bodyValues": { "b": { "value": params.body_text, "isTruncated": false } },
@@ -1349,7 +1388,7 @@ impl JmapMcpService {
                                 "accountId": account_id,
                                 "create": {
                                     "sub": {
-                                        "identityId": identity_id,
+                                        "identityId": from.identity_id,
                                         "emailId": "#draft"
                                     }
                                 },
@@ -1559,7 +1598,8 @@ impl JmapMcpService {
         Ok(aliases_of(me, &domains))
     }
 
-    /// Resolve `(from, identityId)` for a submission.
+    /// Resolve the `From` address, its display name, and the submitting
+    /// identity for a submission.
     ///
     /// Fetches the mailbox's owned addresses, then delegates the decision to
     /// [`choose_from_address`], which is pure and unit-tested.
@@ -1570,7 +1610,7 @@ impl JmapMcpService {
         from: Option<&str>,
         preferred: &[String],
         session_email: Option<&str>,
-    ) -> Result<(String, String), ErrorData> {
+    ) -> Result<ChosenFrom, ErrorData> {
         let owned = self
             .owned_addresses(token, account_id, session_email)
             .await
@@ -1691,43 +1731,46 @@ mod tests {
     /// user, must not resolve to the shared `team@` that sorts first.
     #[test]
     fn never_picks_the_first_listed_address() {
-        let (from, id) = choose_from_address(
+        let chosen = choose_from_address(
             &kampong_mailbox(),
             None,
             &["julian@kampong.social".to_owned()],
             Some("julian@kampong.social"),
         )
         .unwrap();
-        assert_eq!(from, "julian@kampong.social");
-        assert_eq!(id, "I3");
+        assert_eq!(chosen.email, "julian@kampong.social");
+        assert_eq!(chosen.identity_id, "I3");
     }
 
     /// An alias with no Identity object is sendable: `From` carries the alias
     /// and submission borrows the caller's own identity.
     #[test]
     fn alias_without_identity_is_sendable() {
-        let (from, id) = choose_from_address(
+        let chosen = choose_from_address(
             &kampong_mailbox(),
             Some("julian@lindner.earth"),
             &[],
             Some("julian@kampong.social"),
         )
         .unwrap();
-        assert_eq!(from, "julian@lindner.earth");
-        assert_eq!(id, "I3", "should borrow the session user's identity");
+        assert_eq!(chosen.email, "julian@lindner.earth");
+        assert_eq!(
+            chosen.identity_id, "I3",
+            "should borrow the session user's identity"
+        );
     }
 
     /// Case-insensitive, and whitespace-tolerant.
     #[test]
     fn alias_match_is_case_insensitive() {
-        let (from, _) = choose_from_address(
+        let chosen = choose_from_address(
             &kampong_mailbox(),
             Some("  Julian@Lindner.Earth "),
             &[],
             Some("julian@kampong.social"),
         )
         .unwrap();
-        assert_eq!(from, "julian@lindner.earth");
+        assert_eq!(chosen.email, "julian@lindner.earth");
     }
 
     /// Role addresses are refused as a personal From even when asked for
@@ -1872,15 +1915,18 @@ mod tests {
                 name: None,
             },
         ];
-        let (from, id) = choose_from_address(
+        let chosen = choose_from_address(
             &owned,
             Some("julian@lindner.earth"),
             &[],
             Some("julian@kampong.social"),
         )
         .expect("configured alias is sendable");
-        assert_eq!(from, "julian@lindner.earth");
-        assert_eq!(id, "l", "borrows the personal identity, never the role one");
+        assert_eq!(chosen.email, "julian@lindner.earth");
+        assert_eq!(
+            chosen.identity_id, "l",
+            "borrows the personal identity, never the role one"
+        );
     }
 
     /// `reply_email` passes the address the parent was delivered to as the
@@ -1904,15 +1950,15 @@ mod tests {
                 name: None,
             },
         ];
-        let (from, id) = choose_from_address(
+        let chosen = choose_from_address(
             &owned,
             None,
             &["julian@lindner.earth".to_owned()],
             Some("julian@kampong.social"),
         )
         .expect("inbound To is preferred");
-        assert_eq!(from, "julian@lindner.earth");
-        assert_eq!(id, "l");
+        assert_eq!(chosen.email, "julian@lindner.earth");
+        assert_eq!(chosen.identity_id, "l");
     }
 
     /// A role address is refused as an explicit From even when it is a real,
@@ -1965,6 +2011,94 @@ mod tests {
             .is_err(),
             "a role address is not a fallback From"
         );
+    }
+
+    /// The defect: the identity's display name was resolved and then dropped,
+    /// so recipients saw a bare address. JMAP carries the name in its own
+    /// field and does the RFC 5322 quoting, so it is passed through verbatim.
+    #[test]
+    fn from_header_carries_the_identity_display_name() {
+        let owned = vec![OwnedAddress {
+            email: "julian@lindner.earth".into(),
+            identity_id: Some("x".into()),
+            name: Some("Julian Lindner".into()),
+        }];
+        let chosen = choose_from_address(&owned, Some("julian@lindner.earth"), &[], None).unwrap();
+        assert_eq!(chosen.name.as_deref(), Some("Julian Lindner"));
+        assert_eq!(
+            chosen.header(),
+            json!({ "name": "Julian Lindner", "email": "julian@lindner.earth" })
+        );
+    }
+
+    /// Never invent a name: an address with none on file is sent bare, not
+    /// given a guessed one derived from the local part.
+    #[test]
+    fn from_header_omits_the_name_when_there_is_none() {
+        let owned = vec![OwnedAddress {
+            email: "julian@lindner.earth".into(),
+            identity_id: Some("x".into()),
+            name: None,
+        }];
+        let chosen = choose_from_address(&owned, Some("julian@lindner.earth"), &[], None).unwrap();
+        assert_eq!(chosen.header(), json!({ "email": "julian@lindner.earth" }));
+    }
+
+    /// A name that is empty or only whitespace is not a name. Emitting it
+    /// would put a bare `""` in front of the address.
+    #[test]
+    fn blank_display_names_are_dropped_not_emitted() {
+        for blank in ["", "   ", "\t"] {
+            let owned = vec![OwnedAddress {
+                email: "julian@lindner.earth".into(),
+                identity_id: Some("x".into()),
+                name: Some(blank.into()),
+            }];
+            let chosen =
+                choose_from_address(&owned, Some("julian@lindner.earth"), &[], None).unwrap();
+            assert_eq!(
+                chosen.header(),
+                json!({ "email": "julian@lindner.earth" }),
+                "blank name {blank:?} must not reach the header"
+            );
+        }
+    }
+
+    /// The display name is trimmed but otherwise untouched — no re-quoting,
+    /// no escaping. Doing either here would double-encode what JMAP already
+    /// encodes on the wire.
+    #[test]
+    fn display_name_is_passed_through_verbatim() {
+        let owned = vec![OwnedAddress {
+            email: "j@x.test".into(),
+            identity_id: Some("x".into()),
+            name: Some("  Lindner, Julian \"JL\"  ".into()),
+        }];
+        let chosen = choose_from_address(&owned, Some("j@x.test"), &[], None).unwrap();
+        assert_eq!(
+            chosen.header(),
+            json!({ "name": "Lindner, Julian \"JL\"", "email": "j@x.test" })
+        );
+    }
+
+    /// The address is never altered by name resolution.
+    #[test]
+    fn resolving_a_name_never_changes_the_address() {
+        let owned = vec![
+            OwnedAddress {
+                email: "julian@kampong.social".into(),
+                identity_id: Some("l".into()),
+                name: Some("Julian Lindner".into()),
+            },
+            OwnedAddress {
+                email: "julian@lindner.earth".into(),
+                identity_id: Some("x".into()),
+                name: Some("Julian Lindner".into()),
+            },
+        ];
+        let chosen = choose_from_address(&owned, Some("julian@lindner.earth"), &[], None).unwrap();
+        assert_eq!(chosen.email, "julian@lindner.earth");
+        assert_eq!(chosen.identity_id, "x");
     }
 
     #[test]

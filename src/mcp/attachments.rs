@@ -379,7 +379,7 @@ impl JmapMcpService {
             let sent = Self::role_mailbox(&mailboxes, "sent");
 
             let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
-            let (from_addr, identity_id) = self
+            let from = self
                 .resolve_submission_identity(
                     &token.0,
                     &account_id,
@@ -403,7 +403,7 @@ impl JmapMcpService {
             let email_obj = json!({
                 "mailboxIds": { drafts.clone(): true },
                 "keywords": { "$draft": true, "$seen": true },
-                "from": [ { "email": from_addr } ],
+                "from": [ from.header() ],
                 "to": to_addrs,
                 "subject": params.subject,
                 "bodyValues": { "b": { "value": params.body, "isTruncated": false } },
@@ -440,7 +440,7 @@ impl JmapMcpService {
                                 "accountId": account_id,
                                 "create": {
                                     "sub": {
-                                        "identityId": identity_id,
+                                        "identityId": from.identity_id,
                                         "emailId": "#draft"
                                     }
                                 },

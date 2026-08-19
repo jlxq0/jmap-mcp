@@ -170,7 +170,7 @@ impl JmapMcpService {
                 .ok_or_else(|| ErrorData::internal_error("no Drafts mailbox found", None))?;
             let sent = Self::role_mailbox(&mailboxes, "sent");
             let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
-            let (from_addr, identity_id) = self
+            let from = self
                 .resolve_submission_identity(
                     &token.0,
                     &account_id,
@@ -212,7 +212,7 @@ impl JmapMcpService {
             let mut email_obj = json!({
                 "mailboxIds": { drafts.clone(): true },
                 "keywords": { "$draft": true, "$seen": true },
-                "from": [ { "email": from_addr } ],
+                "from": [ from.header() ],
                 "to": to_addrs,
                 "subject": params.subject,
                 "bodyValues": { "b": { "value": params.body_text, "isTruncated": false } },
@@ -244,7 +244,7 @@ impl JmapMcpService {
                             "EmailSubmission/set",
                             json!({
                                 "accountId": account_id,
-                                "create": { "sub": { "identityId": identity_id, "emailId": "#draft" } },
+                                "create": { "sub": { "identityId": from.identity_id, "emailId": "#draft" } },
                                 "onSuccessUpdateEmail": { "#sub": patch }
                             }),
                             "s",
@@ -343,7 +343,7 @@ impl JmapMcpService {
             // actually delivered to; else the signed-in user. Aliases are
             // accepted; shared role addresses are refused.
             let addressed_to = parent_addressed_identities(&parent);
-            let (from_addr, identity_id) = self
+            let from = self
                 .resolve_submission_identity(
                     &token.0,
                     &account_id,
@@ -370,7 +370,7 @@ impl JmapMcpService {
             let mut email_obj = json!({
                 "mailboxIds": { drafts.clone(): true },
                 "keywords": { "$draft": true, "$seen": true },
-                "from": [ { "email": from_addr } ],
+                "from": [ from.header() ],
                 "to": to_objs,
                 "subject": subject,
                 "bodyValues": { "b": { "value": params.body, "isTruncated": false } },
@@ -409,7 +409,7 @@ impl JmapMcpService {
                             "EmailSubmission/set",
                             json!({
                                 "accountId": account_id,
-                                "create": { "sub": { "identityId": identity_id, "emailId": "#draft" } },
+                                "create": { "sub": { "identityId": from.identity_id, "emailId": "#draft" } },
                                 "onSuccessUpdateEmail": { "#sub": patch }
                             }),
                             "s",
@@ -491,7 +491,7 @@ impl JmapMcpService {
 
             // From-address: explicit `from`, else the signed-in user. Never
             // the account's first identity (a shared `team@` role address).
-            let (from_addr, identity_id) = self
+            let from = self
                 .resolve_submission_identity(
                     &token.0,
                     &account_id,
@@ -532,7 +532,7 @@ impl JmapMcpService {
             let email_obj = json!({
                 "mailboxIds": { drafts.clone(): true },
                 "keywords": { "$draft": true, "$seen": true },
-                "from": [ { "email": from_addr } ],
+                "from": [ from.header() ],
                 "to": to_addrs,
                 "subject": subject,
                 "bodyValues": { "b": { "value": body, "isTruncated": false } },
@@ -560,7 +560,7 @@ impl JmapMcpService {
                             "EmailSubmission/set",
                             json!({
                                 "accountId": account_id,
-                                "create": { "sub": { "identityId": identity_id, "emailId": "#draft" } },
+                                "create": { "sub": { "identityId": from.identity_id, "emailId": "#draft" } },
                                 "onSuccessUpdateEmail": { "#sub": patch }
                             }),
                             "s",
@@ -632,7 +632,7 @@ impl JmapMcpService {
             // mailbox does not own at all — and a draft is one click away from
             // being sent by a human in a mail client.
             let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
-            let (from_addr, _) = self
+            let from = self
                 .resolve_submission_identity(
                     &token.0,
                     &account_id,
@@ -645,7 +645,7 @@ impl JmapMcpService {
             let mut email_obj = json!({
                 "mailboxIds": { drafts: true },
                 "keywords": { "$draft": true, "$seen": true },
-                "from": [ { "email": from_addr } ],
+                "from": [ from.header() ],
                 "to": to_addrs,
                 "subject": params.subject,
                 "bodyValues": { "b": { "value": params.body, "isTruncated": false } },
@@ -715,7 +715,7 @@ impl JmapMcpService {
                 // an unowned From here would otherwise sit in the draft and
                 // only fail later at submission, or worse, go out as-is.
                 let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
-                let (from_addr, _) = self
+                let from = self
                     .resolve_submission_identity(
                         &token.0,
                         &account_id,
@@ -724,7 +724,7 @@ impl JmapMcpService {
                         session_email.as_deref(),
                     )
                     .await?;
-                patch.insert("from".to_owned(), json!([ { "email": from_addr } ]));
+                patch.insert("from".to_owned(), json!([from.header()]));
             }
             if let Some(to) = &params.to {
                 let to_addrs: Vec<Value> = to.iter().map(|e| json!({ "email": e })).collect();

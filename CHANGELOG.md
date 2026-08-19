@@ -2,6 +2,24 @@
 
 All notable changes are recorded here. The project uses semantic version tags.
 
+## 0.2.14 — 2026-08-20
+
+### Fixed
+
+- Every compose path resolved the sending identity's display name and then
+  discarded it, so recipients saw a bare address: `julian@lindner.earth`
+  rather than `Julian Lindner <julian@lindner.earth>`. `send_email`,
+  `reply_email`, `forward_email`, `save_draft`, `update_draft`,
+  `send_email_with_attachments`, and `send_email_with_url_attachment` now set
+  the JMAP `EmailAddress` `name` field when the address has one on file.
+
+  The name is only ever the one the mailbox already publishes — an
+  `Identity`'s `name`, or an alias's description. It is never synthesised, and
+  resolving it never changes the address. Blank and whitespace-only names are
+  dropped rather than emitted. JMAP carries the display name in its own field
+  and performs the RFC 5322 quoting and RFC 2047 encoding itself, so the name
+  is passed through verbatim rather than pre-quoted here.
+
 ## 0.2.13 — 2026-08-19
 
 ### Fixed

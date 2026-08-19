@@ -1,6 +1,6 @@
 services:
   jmap-mcp:
-    image: ghcr.io/jlxq0/jmap-mcp:0.2.13
+    image: ghcr.io/jlxq0/jmap-mcp:0.2.14
     platform: linux/amd64
     restart: unless-stopped
     env_file:

@@ -7,8 +7,8 @@ deploy an immutable image digest and upgrade when a new release is published.
 
 | Version | Supported |
 |---|---:|
-| 0.2.13 | yes |
-| 0.2.12 and earlier | no |
+| 0.2.14 | yes |
+| 0.2.13 and earlier | no |
 
 ## Reporting a vulnerability
 

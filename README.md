@@ -57,15 +57,15 @@ curl http://127.0.0.1:3000/health
 The image is published to:
 
 ```text
-ghcr.io/jlxq0/jmap-mcp:0.2.13
-forge.oddie.app/jlxq0/jmap-mcp:v0.2.13
+ghcr.io/jlxq0/jmap-mcp:0.2.14
+forge.oddie.app/jlxq0/jmap-mcp:v0.2.14
 ```
 
 For a direct container invocation:
 
 ```sh
 docker run --rm -p 3000:3000 --env-file .env \
-  ghcr.io/jlxq0/jmap-mcp:0.2.13
+  ghcr.io/jlxq0/jmap-mcp:0.2.14
 ```
 
 Expose port 3000 through HTTPS and configure the MCP client with:
@@ -77,7 +77,7 @@ https://jmap-mcp.your-domain.example/mcp
 `GET /health` is public and returns the running package version:
 
 ```json
-{"status":"healthy","version":"0.2.13"}
+{"status":"healthy","version":"0.2.14"}
 ```
 
 ## Logto and Stalwart setup
