@@ -61,6 +61,15 @@ ghcr.io/jlxq0/jmap-mcp:0.2.14
 forge.oddie.app/jlxq0/jmap-mcp:v0.2.14
 ```
 
+> **`linux/amd64` only.** No `arm64` variant is published, so on Apple Silicon,
+> AWS Graviton, or any other ARM host `docker pull` fails with
+> `no matching manifest for linux/arm64/v8 in the manifest list entries`. Add
+> `--platform linux/amd64` to run it there under emulation:
+>
+> ```sh
+> docker pull --platform linux/amd64 ghcr.io/jlxq0/jmap-mcp:0.2.14
+> ```
+
 For a direct container invocation:
 
 ```sh
