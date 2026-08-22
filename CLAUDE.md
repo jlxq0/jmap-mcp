@@ -44,6 +44,16 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   addresses users send as come from `JMAP_MCP_EXTRA_FROM_ADDRESSES` instead. A
   fallback that is expected to fire still has to say so. Found 2026-08.
 
+- **Editing `.github/workflows/` silently breaks the forge→GitHub mirror.**
+  The push mirror's GitHub PAT lacks the `workflow` scope, so GitHub rejects any
+  push containing a commit that touches a workflow file — and it rejects the
+  *whole* push, `main` and every tag with it. The forge, CI and the cluster all
+  stay green while the public repo, GHCR and the SBOM silently fall behind; the
+  only evidence is `last_error` on
+  `GET /api/v1/repos/jlxq0/jmap-mcp/push_mirrors`. Check that endpoint after any
+  workflow edit until the PAT is regranted `workflow` scope. Found 2026-08:
+  v0.2.12 edited `ci.yml` and v0.2.12–v0.2.14 never reached GitHub.
+
 ## CI / deploy
 
 - Forgejo Actions (`.forgejo/workflows/ci.yml`) build and scan the
