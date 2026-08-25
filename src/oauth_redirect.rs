@@ -197,6 +197,22 @@ mod tests {
             &allowed,
             "https://localhost:3118/cb"
         ));
+
+        // The parser canonicalises `127.1` and `0177.0.0.1` to `127.0.0.1`
+        // before the loopback host check, so an obfuscated spelling reaches the
+        // relaxation by exactly the same path as the plain one. The entry-scheme
+        // check is what stops all three; the shape of the host is not.
+        for entry in [
+            "https://127.0.0.1:8443/cb",
+            "https://127.1:8443/cb",
+            "https://0177.0.0.1:8443/cb",
+        ] {
+            let allowed = parse_allowlist(entry, "TEST").unwrap();
+            assert!(
+                !is_allowed_redirect_uri(&allowed, "http://127.0.0.1:3118/cb"),
+                "{entry} must not be satisfied by cleartext"
+            );
+        }
     }
 
     #[test]
