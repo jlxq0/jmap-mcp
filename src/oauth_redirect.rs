@@ -41,6 +41,12 @@ pub fn is_allowed_redirect_uri(allowed: &[String], uri: &str) -> bool {
 /// RFC 8252 loopback redirects use an ephemeral port. Keep every other URI
 /// component pinned to the operator's allowlist entry so variable ports do not
 /// become a general wildcard.
+///
+/// The entry-side loopback host check is redundant today — `validate_redirect_uri`
+/// already refuses an `http` entry on a non-loopback host, so with the entry-scheme
+/// check in place it can never be the deciding term. It is kept as the second lock:
+/// if the validator ever loosens, this is what still refuses to relax the port for a
+/// remote host. Mutating it alone therefore breaks no test, by construction.
 fn loopback_redirect_matches(configured: &str, candidate: &Url) -> bool {
     let Ok(configured) = Url::parse(configured) else {
         return false;
@@ -162,6 +168,34 @@ mod tests {
         assert!(!is_allowed_redirect_uri(
             &allowed,
             "https://localhost:49152/callback"
+        ));
+    }
+
+    /// The port carve-out keys off the *entry's* scheme, not just the request's.
+    /// An operator who allowlists a TLS listener on a loopback host must not have
+    /// it answered by a cleartext one: dropping the entry-scheme check turns
+    /// `https://localhost:8443/cb` into a wildcard over `http://localhost:*/cb`,
+    /// which is the authorization code in the clear.
+    #[test]
+    fn loopback_https_entry_is_not_downgraded_to_cleartext() {
+        let allowed = parse_allowlist("https://localhost:8443/cb", "TEST").unwrap();
+
+        assert!(is_allowed_redirect_uri(
+            &allowed,
+            "https://localhost:8443/cb"
+        ));
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "http://localhost:3118/cb"
+        ));
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "http://localhost:8443/cb"
+        ));
+        // The port stays pinned for an https entry even on a loopback host.
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "https://localhost:3118/cb"
         ));
     }
 
