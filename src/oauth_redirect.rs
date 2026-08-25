@@ -127,6 +127,13 @@ mod tests {
             &allowed,
             "https://attacker.example/callback"
         ));
+        // The RFC 8252 §7.3 port carve-out is loopback-only: an https callback
+        // keeps its port pinned, so a redirect to another listener on the same
+        // host is not smuggled in.
+        assert!(!is_allowed_redirect_uri(
+            &allowed,
+            "https://claude.ai:8443/api/mcp/auth_callback"
+        ));
     }
 
     /// RFC 8252 section 7.3 requires authorization servers to accept the
