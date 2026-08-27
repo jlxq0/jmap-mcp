@@ -83,6 +83,18 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   field a session naturally reads before merging. Attempt the merge and read
   the HTTP status; do not pre-check `mergeable` and conclude the way is clear.
 
+- **`git rev-parse <annotated-tag>` returns the tag object, not the commit.**
+  Every release tag here is annotated, so `git rev-parse v0.2.14` is
+  `22b4507c` while the commit is `41d6c8f0`. Comparing that against a commit
+  sha reports **NO MATCH for a tag that does point at it**, which is a
+  confident wrong answer in the place a script decides whether a release is on
+  `main`. Measured 2026-08-27. `git merge-base --is-ancestor` and
+  `git log -1 --format=%H` peel on their own and are safe; `git rev-parse` and
+  any string comparison built on it are not. Peel with `^{commit}` whenever the
+  sha is printed, compared, or handed to another tool. Same class as the
+  `mergeable` note above: a field that answers a different question than the
+  one asked, in the place everyone looks.
+
 - A cache is not capped merely because expired entries are swept at a threshold. If every entry is still live, insertion can exceed the threshold; enforce a hard bound and test it with more than the configured capacity.
 - Never refresh JWKS independently for every attacker-controlled unknown `kid`. Serialize refreshes and apply a short global cooldown while preserving normal key rotation.
 - Validating a URL's DNS result and then resolving it again during the request leaves a DNS-rebinding gap. Pin the validated socket addresses into the fetch client.

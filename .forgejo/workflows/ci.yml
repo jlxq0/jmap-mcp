@@ -68,10 +68,44 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # v2.1.1
         with: { command: check bans licenses sources }
 
+  # A tag build publishes an image and moves `latest`. Nothing else checks that
+  # the tagged commit is on `main`, and it has already gone wrong: v0.2.7 and
+  # v0.2.8 were cut from branches that were never merged and both published
+  # (jlxq0/jmap-mcp#14). This is also what makes the buildcache comment in the
+  # `docker` job true rather than hoped for -- "a tag build is the same commit
+  # as the `main` build that preceded it" is only sound if the tag is on `main`.
+  #
+  # Runs on every event so that `docker`'s `needs` is never satisfied by a
+  # skipped job: a skipped job reports success, which is the failure mode this
+  # repository already documents for `docker` itself.
+  tag-ancestry:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with: { fetch-depth: 0, persist-credentials: false }
+      - name: Refuse a tag that is not an ancestor of main
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "not a tag build; nothing to check"
+            exit 0
+          fi
+          git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main
+          # Peel the tag: `git rev-parse <annotated-tag>` returns the tag object,
+          # not the commit, so the sha printed below would name the wrong object.
+          # `merge-base` peels on its own, but the message must not.
+          SHA="$(git rev-parse "${GITHUB_REF}^{commit}")"
+          if git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "ok: ${GITHUB_REF#refs/tags/} -> ${SHA} is an ancestor of main"
+          else
+            echo "::error::${GITHUB_REF#refs/tags/} points at ${SHA}, which is not an ancestor of main. Merge it first, then re-cut the tag."
+            exit 1
+          fi
+
   # buildctl talks to Pada's buildkitd over TCP. Registry-backed layer cache.
   docker:
     runs-on: ubuntu-22.04
-    needs: cargo
+    needs: [cargo, tag-ancestry]
     permissions: { contents: read, packages: write }
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
