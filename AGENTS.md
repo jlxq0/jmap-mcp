@@ -44,21 +44,33 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   addresses users send as come from `JMAP_MCP_EXTRA_FROM_ADDRESSES` instead. A
   fallback that is expected to fire still has to say so. Found 2026-08.
 
-- **Editing `.github/workflows/` can silently break the forge→GitHub mirror.**
-  When the push mirror's GitHub PAT lacks the `workflow` scope, GitHub rejects
-  any push containing a commit that touches a workflow file — and it rejects the
-  *whole* push, `main` and every tag with it. The forge, CI and the cluster all
-  stay green while the public repo, GHCR and the SBOM silently fall behind; the
-  only evidence is `last_error` on
-  `GET /api/v1/repos/jlxq0/jmap-mcp/push_mirrors`. Found 2026-08: v0.2.12 edited
-  `ci.yml` and three tags went missing from the public repo. **Observed clear on
-  2026-08-26**, by three checks that can disagree: GitHub carries v0.2.12,
-  v0.2.13 and v0.2.14 at shas matching the forge; GitHub `main` equals forge
-  `main` at 71c0268; and 2023000, the commit that touches `.github/workflows/`,
-  returns 200 from GitHub's API. A push carrying a workflow file therefore
-  succeeded, so the scope was granted rather than the block merely being dodged.
-  Nothing says that grant is permanent: read `last_error` after the next
-  workflow edit instead of assuming.
+- **Editing `.github/workflows/` silently breaks the forge→GitHub mirror, and
+  it is broken right now.** The push mirror's GitHub PAT lacks the `workflow`
+  scope, so GitHub rejects any push containing a commit that touches a workflow
+  file, and it rejects the *whole* push, `main` and every tag with it. The
+  forge, CI and the cluster all stay green while the public repo, GHCR and the
+  SBOM fall behind; the only evidence is `last_error` on
+  `GET /api/v1/repos/jlxq0/jmap-mcp/push_mirrors`.
+
+  Live as of 2026-08-27T03:00:34Z, from `859399b` editing
+  `.github/workflows/release.yml`:
+
+      ! [remote rejected] main -> main (refusing to allow a Personal Access
+      Token to create or update workflow `.github/workflows/release.yml`
+      without `workflow` scope)
+
+  Forge `main` is `236f9a6`, GitHub `main` is `0e73d2f1`, four commits behind,
+  and GitHub carries 14 tags against the forge's 22.
+
+  **The 2026-08-26 note in this file said the block was cleared, and that
+  inference was wrong.** It rested on `2023000` modifying
+  `.github/workflows/ci.yml` and returning 200 from GitHub's API, read as
+  proof that a workflow-carrying push had succeeded and therefore that the
+  scope was granted. A commit reaching GitHub says nothing about *which*
+  credential put it there or what scope that credential holds today. Three
+  checks that agree can all be answering a question other than the one asked.
+  **Only `last_error` after your own workflow-touching push answers it**, and
+  it must be read every time rather than concluded once.
 
 - **`main` requires `CI / cargo*`, and excludes `CI / docker` on purpose.** The
   `docker` job carries `needs: cargo` (`.forgejo/workflows/ci.yml:74`), and a
