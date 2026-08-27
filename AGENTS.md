@@ -73,6 +73,16 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   `CI / cargo (pull_request)`. Do not tidy this up by adding `docker` to the
   required contexts; the rule shows what is required and cannot show why.
 
+- **A pull request's `mergeable` field is not the merge gate, and it reads
+  `true` when the merge is refused.** Measured 2026-08-27 on PR #13 while
+  `CI / cargo` was still pending: the merge API returned **405** with
+  `not allowed to merge [reason: Not all required status checks successful]`,
+  and `GET /pulls/13` reported `mergeable=true` at that same moment.
+  `mergeable` answers whether the branches merge without conflict, which is a
+  different question from whether branch protection permits it, and it is the
+  field a session naturally reads before merging. Attempt the merge and read
+  the HTTP status; do not pre-check `mergeable` and conclude the way is clear.
+
 - A cache is not capped merely because expired entries are swept at a threshold. If every entry is still live, insertion can exceed the threshold; enforce a hard bound and test it with more than the configured capacity.
 - Never refresh JWKS independently for every attacker-controlled unknown `kid`. Serialize refreshes and apply a short global cooldown while preserving normal key rotation.
 - Validating a URL's DNS result and then resolving it again during the request leaves a DNS-rebinding gap. Pin the validated socket addresses into the fetch client.
