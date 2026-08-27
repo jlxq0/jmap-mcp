@@ -152,6 +152,18 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   attribution would be a bearer-per-agent decision and is not this repository's
   to make.
 
+  **And do not repair this by pairing on `token_hash`.** The `ingress chain
+  length` line carries no `token_hash`; the `audit` line does, about 24 µs
+  earlier, so correlating them is an inference from adjacency rather than a
+  field read, and under concurrency another request's audit line lands between
+  a request's own two. Pairing on the hash looks like the fix and is not one:
+  every mounting session presents the same bearer, so two concurrent requests
+  carry **identical** hashes and the pairing is exactly as ambiguous as
+  adjacency with the appearance of attribution added. It would pass review.
+  A real fix needs a per-request correlation id, or the count folded into the
+  audit event. The line is left alone on purpose: what it answers is a property
+  of the deployment rather than of a request, so it needs no subject.
+
 - **A request count in this log is not a call count.** One
   `mcp__jmap__whoami` produced **seven** authenticated requests, at
   2026-08-27T04:12:08.290281Z through .347111Z, 57 ms apart end to end. The

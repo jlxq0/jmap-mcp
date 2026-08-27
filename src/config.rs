@@ -85,29 +85,40 @@ pub const ENV_UPLOAD_MAX_BYTES: &str = "JMAP_MCP_UPLOAD_MAX_BYTES";
 /// proxy it turns a wrong address into a chosen one, which is worse. Check
 /// what the front-most proxy does before changing it.
 ///
-/// # The residual this value carries, and who can close it
+/// # The residual this value carries, and the one line that would open it
 ///
 /// A caller that reaches the Cilium gateway **directly**, bypassing the edge,
 /// has a real chain depth of 1. It sends its own `X-Forwarded-For`, Envoy
 /// appends, `len` becomes 2, the `len < hops` guard never fires, and this
 /// value selects `parts[0]`: **the caller's own string, written into the audit
-/// record as the client address.** It needs a stolen bearer plus a path to the
-/// gateway, so it yields a forged provenance entry rather than access, which
+/// record as the client address.** Forged provenance rather than access, which
 /// is the failure that reads as settled rather than as unknown.
 ///
-/// **Nothing in this process can assert the mitigation**, which is that the
-/// gateway is not reachable off the cluster's LAN. What was measurable from
-/// outside, 2026-08-27, from one host with a same-moment control:
+/// **The asymmetry matters and is why "use the edge-inclusive depth" is not a
+/// complete instruction**: on that bypass path `2` is *worse* than `1`, since
+/// `1` selects an infrastructure address and `2` selects whatever the caller
+/// typed. The same setting that fixes the ordinary path turns a wrong-but-inert
+/// value into a caller-controlled one on the other.
+///
+/// **The mitigation is a cluster fact and nothing in this process asserts it.**
+/// Measured 2026-08-27: the gateway is unreachable from the public internet
+/// *and from the LAN*, and answers only to code running inside the cluster.
+/// From one external host, with a same-moment control proving the path works:
 ///
 ///     203.24.209.8:443   edge (Caddy)         OPEN
 ///     203.24.209.5:443   cilium-gateway-web   timeout, 6s
 ///     203.24.209.5:80    cilium-gateway-web   timeout, 6s
 ///
-/// The edge answering at that moment shows the path to `203.24.209.0/24`
-/// works, so the gateway timing out is the gateway rather than that host's
-/// network. That covers the public internet from a single vantage and says
-/// **nothing** about a caller on the cluster's LAN or inside the cluster.
-/// Those are cluster facts and belong to whoever owns the cluster.
+/// `fondue` holds `203.24.209.5/32` as a `MetalLB` `BGPAdvertisement` peered across
+/// `sgp`, `lax` and `zrh`; the L2 pool is `home-lan` on `10.0.10.240`. Nothing
+/// on the wifi has a route to it.
+///
+/// **What would open it is one line in the deployment manifest.** This
+/// service's `HTTPRoute` has exactly one `parentRef`, `gateway/web`
+/// (`sectionName: http`), as do all 89 routes on the cluster. Adding
+/// `gateway/home` as a second makes the service LAN-reachable with nothing
+/// else changing: no alert, no failing test, no visible difference in this pod.
+/// The assertion therefore lives in `oddie-apps/platform`, not here.
 const ENV_TRUSTED_PROXY_HOPS: &str = "JMAP_MCP_TRUSTED_PROXY_HOPS";
 /// Optional IP to connect to when reaching the Stalwart host, overriding DNS.
 /// Used in-cluster to avoid hairpin NAT on the public `LoadBalancer`: we keep
