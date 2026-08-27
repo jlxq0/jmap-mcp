@@ -83,6 +83,42 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   field a session naturally reads before merging. Attempt the merge and read
   the HTTP status; do not pre-check `mergeable` and conclude the way is clear.
 
+- **`git rev-parse <annotated-tag>` returns the tag object, not the commit.**
+  Every release tag here is annotated, so `git rev-parse v0.2.14` is
+  `22b4507c` while the commit is `41d6c8f0`. Comparing that against a commit
+  sha reports **NO MATCH for a tag that does point at it**, which is a
+  confident wrong answer in the place a script decides whether a release is on
+  `main`. Measured 2026-08-27. `git merge-base --is-ancestor` and
+  `git log -1 --format=%H` peel on their own and are safe; `git rev-parse` and
+  any string comparison built on it are not. Peel with `^{commit}` whenever the
+  sha is printed, compared, or handed to another tool. Same class as the
+  `mergeable` note above: a field that answers a different question than the
+  one asked, in the place everyone looks.
+
+- **A queued Actions run is invisible in the tasks API, so a pending required
+  context is not evidence that no run was scheduled.** `created_at` on a task
+  is when it *starts*, not when it is queued. PR #16 opened
+  2026-08-27T02:27:23Z; the task list's newest entry stayed at 02:25:35 for
+  eleven minutes, and its run was created at **02:38:53**, 11m30s later. The
+  `macos-27`/shared runner is capacity 1 across every repository on this forge,
+  so that wait is ordinary rather than a fault.
+
+  Read as "no run exists", it produces exactly the wrong action: a second push
+  to re-trigger **cancels the queued run under ref-scoped concurrency and
+  requeues from the back**. That is what happened here, and the replacement did
+  not start until 02:46:26. The push cost nine minutes rather than saving them.
+  Before concluding a context is stuck, check `on:` for the trigger and wait
+  past the queue; a run that has not started reports nothing anywhere.
+
+- **Three further ways a gate's state stops being about the code**, all
+  answered by the workflow's `on:` block and none of them by the statuses on
+  past commits: a job skipped because its `needs:` failed posts `success`
+  without doing the work; a workflow with no `pull_request` trigger posts
+  nothing at all on a PR head; a repository with no PR history has never
+  produced its PR contexts, so their absence says nothing about whether it
+  would. Reading a `(push)`-only status history as evidence that a job is
+  push-only is the mistake this prevents. Read `on:`.
+
 - A cache is not capped merely because expired entries are swept at a threshold. If every entry is still live, insertion can exceed the threshold; enforce a hard bound and test it with more than the configured capacity.
 - Never refresh JWKS independently for every attacker-controlled unknown `kid`. Serialize refreshes and apply a short global cooldown while preserving normal key rotation.
 - Validating a URL's DNS result and then resolving it again during the request leaves a DNS-rebinding gap. Pin the validated socket addresses into the fetch client.

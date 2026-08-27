@@ -31,6 +31,21 @@ jobs:
           cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
           test "$tag_version" = "$cargo_version"
 
+      - name: Refuse a tag that is not an ancestor of main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main
+          # `git rev-parse <annotated-tag>` returns the tag object, not the
+          # commit, so peel before reporting the sha. See jlxq0/jmap-mcp#14.
+          sha="$(git rev-parse "${GITHUB_REF}^{commit}")"
+          if git merge-base --is-ancestor "$sha" origin/main; then
+            echo "ok: ${GITHUB_REF_NAME} -> ${sha} is an ancestor of main"
+          else
+            echo "::error::${GITHUB_REF_NAME} points at ${sha}, which is not an ancestor of main. Merge it first, then re-cut the tag."
+            exit 1
+          fi
+
       - name: OSV dependency audit
         uses: google/osv-scanner-action/osv-scanner-action@6e4298ebc4db23e847df9b2e2de2939d6f066c67
         with:
