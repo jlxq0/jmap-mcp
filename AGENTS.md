@@ -72,6 +72,41 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   **Only `last_error` after your own workflow-touching push answers it**, and
   it must be read every time rather than concluded once.
 
+- **An image can reach the registry without CI, and the ancestry gate cannot
+  see it.** `v0.2.5` and `v0.2.6` are in the forge registry with no git tag
+  anywhere and no Actions run that could have built them. Measured 2026-08-27:
+  on 2026-08-16 the repository ran **six** Actions tasks, **all `cargo`, all
+  `failure`, no `docker` job at all**, and the first `docker` job to succeed
+  after 2026-08-14 was 2026-08-18T01:29:29Z, two days later. Yet the `v0.2.5`
+  image was created **129 seconds** after commit `09b5f5b` and `v0.2.6` **931
+  seconds** after `c0a9353`. That cadence, with CI red, is a local
+  `docker build && push`.
+
+  So the tag-ancestry gate closes tags cut off unmerged branches and closes
+  nothing here: **it runs in CI, and this path never enters CI.** Anything
+  holding registry push credentials can publish, and the result is
+  indistinguishable in the registry from a released image. Corroborating: both
+  carry **no OCI labels**, consistent with predating `0ebc967` which added the
+  `LABEL` block, so there is no `org.opencontainers.image.revision` to recover.
+  The only remaining route to their source is rebuilding a candidate commit and
+  comparing layer digests. Tracked on issue #14.
+
+- **Every release from `v0.1.0` to `v0.2.9` shipped a binary reporting version
+  `0.0.1`.** `Cargo.toml` carried `version = "0.0.1"` from the initial commit
+  until `0ebc967`, so `CARGO_PKG_VERSION` was `0.0.1` in the `User-Agent` sent
+  to Logto and Stalwart, in the OTLP `service.version`, and in the `version`
+  field `main.rs` serves. Verified by reading the literal out of the shipped
+  binaries:
+
+      v0.2.4  jmap-mcp/0.0.1     v0.2.7   jmap-mcp/0.0.1
+      v0.2.5  jmap-mcp/0.0.1     v0.2.14  jmap-mcp/0.2.14
+      v0.2.6  jmap-mcp/0.0.1     v0.2.16  jmap-mcp/0.2.16
+
+  Fixed at `0ebc967`, which set the real version **and** added
+  `test "${V#v}" = "$VERSION"` to the tag build in the same commit. **That
+  check is the only thing preventing recurrence**, and it looks like ceremony
+  next to a tag you just typed. Do not remove it.
+
 - **`main` requires `CI / cargo*`, and excludes `CI / docker` on purpose.** The
   `docker` job carries `needs: cargo` (`.forgejo/workflows/ci.yml:74`), and a
   Forgejo job skipped because the job it needs failed still posts **`success`**
@@ -238,6 +273,19 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
 - A hand-written loopback host check compares parsed hosts, not the text the client sent. The WHATWG URL parser canonicalizes `127.1` and `0177.0.0.1` to `127.0.0.1` and normalizes `/x/../cb` to `/cb`, so those match a `127.0.0.1` entry; `[::ffff:127.0.0.1]` and `/%63b` do not normalize and are rejected. Enumerate loopback hosts against `Url::host_str()` output, and assert the accepted and rejected spellings rather than reasoning about them.
 - Relaxing the redirect port must key off the allowlist *entry's* scheme, not only the request's. Checking only the request lets an allowlisted `https://localhost:8443/cb` be satisfied by `http://localhost:*/cb`, putting the authorization code on the wire in cleartext.
 - A defence-in-depth guard that no mutation can turn red is not dead code, but nothing will tell you it broke. Say so in a comment where it lives, or a later reader deletes it as redundant.
+
+## Where fleet facts live
+
+- **Which sessions mount this server is answered by
+  `~/Smithy/<name>_agent/wt/main/src/mcp.json`**, moved there under
+  `jlxq0/mantis#122`. They are in neither `~/.claude.json` nor any project
+  `.mcp.json`. On 2026-08-27 three sweeps of those two locations returned
+  nothing while four sessions (`honoka`, `lucy`, `mantis`, `penny`) mounted
+  jmap-mcp and `vryan` did not, which makes `vryan` a usable negative control.
+  **A sweep returning zero is the expected result of looking in the wrong
+  place, not evidence that nothing mounts the server**, and the two are
+  indistinguishable from the output. Read the `mcpServers` keys, never the
+  `headers` values.
 
 ## CI / deploy
 
