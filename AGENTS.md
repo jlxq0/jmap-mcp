@@ -164,6 +164,12 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   healthy image. It was caught only by running both methods against a tag whose
   answer was already known, which is the point of dry-running a check against
   a known state before the moment it matters.
+
+  Why the fleet rule reads as it does: measured across the five deployed MCP
+  servers, `caldav-mcp`, `hevy-mcp`, `matrix-mcp` and `typst-mcp` all publish a
+  **single** manifest, where `-v` returns an object and the rule is correct.
+  `jmap-mcp` is the only index among them, so the precondition had never been
+  visible. Do not "simplify" this entry back to the fleet form.
 - A shell-level `RUSTUP_TOOLCHAIN` overrides `rust-toolchain.toml`. Verify the exact MSRV in CI, and pair version-new Clippy allowances with `unknown_lints` so the pinned compiler can still build.
 - **`RUSTUP_TOOLCHAIN` unset is not enough: mise's `rustc` shim resolves
   `stable` and ignores `rust-toolchain.toml`.** Measured 2026-08-27 with
