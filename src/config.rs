@@ -84,6 +84,30 @@ pub const ENV_UPLOAD_MAX_BYTES: &str = "JMAP_MCP_UPLOAD_MAX_BYTES";
 /// So raising this number is not a free safety margin. Behind an appending
 /// proxy it turns a wrong address into a chosen one, which is worse. Check
 /// what the front-most proxy does before changing it.
+///
+/// # The residual this value carries, and who can close it
+///
+/// A caller that reaches the Cilium gateway **directly**, bypassing the edge,
+/// has a real chain depth of 1. It sends its own `X-Forwarded-For`, Envoy
+/// appends, `len` becomes 2, the `len < hops` guard never fires, and this
+/// value selects `parts[0]`: **the caller's own string, written into the audit
+/// record as the client address.** It needs a stolen bearer plus a path to the
+/// gateway, so it yields a forged provenance entry rather than access, which
+/// is the failure that reads as settled rather than as unknown.
+///
+/// **Nothing in this process can assert the mitigation**, which is that the
+/// gateway is not reachable off the cluster's LAN. What was measurable from
+/// outside, 2026-08-27, from one host with a same-moment control:
+///
+///     203.24.209.8:443   edge (Caddy)         OPEN
+///     203.24.209.5:443   cilium-gateway-web   timeout, 6s
+///     203.24.209.5:80    cilium-gateway-web   timeout, 6s
+///
+/// The edge answering at that moment shows the path to `203.24.209.0/24`
+/// works, so the gateway timing out is the gateway rather than that host's
+/// network. That covers the public internet from a single vantage and says
+/// **nothing** about a caller on the cluster's LAN or inside the cluster.
+/// Those are cluster facts and belong to whoever owns the cluster.
 const ENV_TRUSTED_PROXY_HOPS: &str = "JMAP_MCP_TRUSTED_PROXY_HOPS";
 /// Optional IP to connect to when reaching the Stalwart host, overriding DNS.
 /// Used in-cluster to avoid hairpin NAT on the public `LoadBalancer`: we keep
