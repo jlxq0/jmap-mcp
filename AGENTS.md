@@ -142,6 +142,18 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
 - DNS pinning is ineffective when an environment-configured proxy resolves the target hostname; SSRF-guarded one-off fetch clients must bypass proxies.
 - A clean RustSec audit does not cover the runtime base image. Scan the final container, keep the distroless digest current, and block releases on fixed HIGH/CRITICAL OS-package vulnerabilities.
 - A shell-level `RUSTUP_TOOLCHAIN` overrides `rust-toolchain.toml`. Verify the exact MSRV in CI, and pair version-new Clippy allowances with `unknown_lints` so the pinned compiler can still build.
+- **`RUSTUP_TOOLCHAIN` unset is not enough: mise's `rustc` shim resolves
+  `stable` and ignores `rust-toolchain.toml`.** Measured 2026-08-27 with
+  `RUSTUP_TOOLCHAIN` unset, `rust-toolchain.toml` pinning `1.93.0` and
+  `.forgejo/workflows/ci.yml:35` pinning `1.93.0`: `rustc --version` reported
+  **1.98.0**, resolved through `~/.local/share/mise/shims/rustc`. So a local
+  green can be on the wrong compiler with every visible signal agreeing, which
+  is the opposite direction from the env-var route above and needs no
+  misconfiguration to happen. Run `cargo +1.93.0 …`, and read the pin out of
+  `git show origin/main:.forgejo/workflows/ci.yml` rather than assuming it.
+  The specimen: `clippy::naive_bytecount` rejected the first spelling of
+  `xff_entry_count`. That lint fires on 1.93.0 and the 1.98.0 shim would have
+  passed it straight to CI.
 - RustSec and GitHub's advisory database are not identical. Check both before tagging a public release; a passing `cargo audit` alone can miss GitHub-reviewed Rust advisories.
 - Docker Buildx and raw `buildctl` use different attestation flags. Buildx accepts `--attest`; `buildctl build` requires frontend options such as `--opt attest:sbom=` and `--opt attest:provenance=mode=max`.
 - Native OAuth clients can select an ephemeral loopback listener port even when given a preferred port. Match allowlisted loopback HTTP callbacks on the exact host, path, and query while permitting only the port to vary; keep HTTPS and private-use callbacks exact.
