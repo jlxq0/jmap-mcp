@@ -124,8 +124,9 @@ impl LastUsedTracker {
 /// trusted proxy on the path is expected to *append* the IP it saw
 /// when the request arrived at it; the rightmost N entries are
 /// therefore the ones we trust. The default of 1 trusted proxy assumes
-/// a typical "ingress (Traefik / nginx / etc.) in front of the jmap-mcp
-/// pod" deployment; override via `JMAP_MCP_TRUSTED_PROXY_HOPS`.
+/// the deployed topology: client -> Caddy edge -> Cilium gateway -> pod,
+/// two appended entries. Override via `JMAP_MCP_TRUSTED_PROXY_HOPS` anywhere
+/// the chain is a different length; see `config::ENV_TRUSTED_PROXY_HOPS`.
 ///
 /// Returns `None` when the header is absent, has fewer entries than
 /// the trusted-hops count, or contains no parseable IP at the trusted
@@ -266,14 +267,14 @@ mod tests {
 
     #[test]
     fn parse_client_ip_with_one_trusted_hop_takes_rightmost() {
-        // Single-entry XFF with one trusted hop → that's the IP Traefik saw.
+        // Single-entry XFF with one trusted hop: the address the sole proxy saw.
         assert_eq!(
             parse_client_ip(Some("203.0.113.5"), 1),
             Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)))
         );
         // The leftmost entry is the **claimed** client IP and may be
         // spoofed; with one trusted proxy in front, the rightmost is
-        // the real one (Traefik appends what it saw).
+        // the real one (the nearest proxy appends what it saw).
         assert_eq!(
             parse_client_ip(Some("1.2.3.4, 10.0.0.1, 198.51.100.7"), 1),
             Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)))
