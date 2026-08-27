@@ -54,7 +54,36 @@ const ENV_DOWNLOAD_MAX_BYTES: &str = "JMAP_MCP_DOWNLOAD_MAX_BYTES";
 /// Maximum bytes `upload_blob_from_url` will fetch before uploading to
 /// Stalwart's blob store. Default 10 MiB.
 pub const ENV_UPLOAD_MAX_BYTES: &str = "JMAP_MCP_UPLOAD_MAX_BYTES";
-/// Number of trusted proxies in front of jmap-mcp. Default 1 (Traefik).
+/// Number of trusted proxies in front of jmap-mcp.
+///
+/// Default 2, which is this fleet's topology and not a universal:
+/// client -> Caddy edge -> Cilium gateway -> pod. The edge sets no
+/// `trusted_proxies`, so it **replaces** `X-Forwarded-For` with its peer
+/// (entry 1, the client); Cilium runs `gateway-api-xff-num-trusted-hops: 0`,
+/// so Envoy **appends** the downstream address (entry 2, the edge). Measured
+/// at the pod 2026-08-27 as `xff_entries=2`, and derived independently from
+/// `oddie-apps/edge-config`, which is why the number is written down here
+/// with the systems that produce it named beside it.
+///
+/// **A deployment not behind that edge must override this.** A backend behind
+/// the LAN-only `home` gateway (`10.0.10.240`) sees **one** entry, and moving
+/// between the two gateways changes the correct value with nothing reporting
+/// it.
+///
+/// **2 is safe here only because the edge replaces rather than appends**, and
+/// that is a property of the edge rather than of the number. `parse_client_ip`
+/// counts in from the right, so:
+///
+/// - too low records a proxy's address as the client's, confidently;
+/// - too high blanks the field **only** when the chain is genuinely shorter
+///   *and* nothing preserved a client-supplied entry. Behind a front-most
+///   proxy that **appends**, a client sending `X-Forwarded-For: 1.2.3.4`
+///   produces `1.2.3.4, <client>`; `len` is then 2, the `len < hops` guard
+///   never fires, and a hop count of 2 selects the **attacker's** value.
+///
+/// So raising this number is not a free safety margin. Behind an appending
+/// proxy it turns a wrong address into a chosen one, which is worse. Check
+/// what the front-most proxy does before changing it.
 const ENV_TRUSTED_PROXY_HOPS: &str = "JMAP_MCP_TRUSTED_PROXY_HOPS";
 /// Optional IP to connect to when reaching the Stalwart host, overriding DNS.
 /// Used in-cluster to avoid hairpin NAT on the public `LoadBalancer`: we keep
@@ -76,7 +105,7 @@ const DEFAULT_RATE_LIMIT_READS: u32 = 60;
 const DEFAULT_RATE_LIMIT_WRITES: u32 = 30;
 const DEFAULT_DOWNLOAD_MAX_BYTES: u64 = 5 * 1024 * 1024;
 pub const DEFAULT_UPLOAD_MAX_BYTES: usize = 10 * 1024 * 1024;
-const DEFAULT_TRUSTED_PROXY_HOPS: usize = 1;
+const DEFAULT_TRUSTED_PROXY_HOPS: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -448,6 +477,64 @@ mod extra_from_address_tests {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The default is a measurement of this fleet's ingress, not a guess.
+    ///
+    /// client -> Caddy edge -> Cilium gateway -> pod is two appended entries,
+    /// observed at the pod as `xff_entries=2` on 2026-08-27 and derived
+    /// separately from the edge config. `parse_client_ip` counts in from the
+    /// right, so 1 against a two-entry header selects the edge's own address
+    /// and writes it into the audit trail as the client's.
+    ///
+    /// If this assertion fails, the topology changed or someone reverted the
+    /// constant. Re-measure with the `ingress chain length` log line before
+    /// changing the number.
+    /// Why the default is only correct behind a *replacing* front proxy.
+    ///
+    /// Found by Codex in review of the 1 -> 2 change, and it contradicts the
+    /// tidy claim that a higher hop count always fails safe. Behind a proxy
+    /// that appends instead of replacing, a client pads the header and the
+    /// `len < hops` guard never fires, so the selected entry is the client's
+    /// own. Our edge replaces, which is what makes 2 correct here; this test
+    /// exists so the next person raising the number meets the reason.
+    #[test]
+    fn a_padded_chain_defeats_a_higher_hop_count() {
+        // Appending proxy: client sent "1.2.3.4", proxy appended what it saw.
+        let padded = "1.2.3.4, 198.51.100.9";
+        assert_eq!(
+            crate::last_used::parse_client_ip(Some(padded), 2),
+            Some("1.2.3.4".parse().unwrap()),
+            "hops=2 on a padded 2-entry chain selects the attacker's entry"
+        );
+        assert_eq!(
+            crate::last_used::parse_client_ip(Some(padded), 1),
+            Some("198.51.100.9".parse().unwrap()),
+            "hops=1 there selects what the proxy actually saw"
+        );
+        // Replacing edge, which is our path: the client's value is gone before
+        // the gateway appends, so no padding survives to be selected.
+        let replaced = "203.0.113.5, 10.0.0.1";
+        assert_eq!(
+            crate::last_used::parse_client_ip(Some(replaced), 2),
+            Some("203.0.113.5".parse().unwrap()),
+            "hops=2 behind a replacing edge selects the real client"
+        );
+    }
+
+    #[test]
+    fn default_trusted_proxy_hops_matches_the_measured_chain_length() {
+        assert_eq!(
+            DEFAULT_TRUSTED_PROXY_HOPS, 2,
+            "measured xff_entries=2 at the pod; 1 records the edge as the client"
+        );
+        // And the pairing that makes it matter, on a two-entry header.
+        let xff = "203.0.113.5, 10.0.0.1";
+        assert_eq!(
+            crate::last_used::parse_client_ip(Some(xff), DEFAULT_TRUSTED_PROXY_HOPS),
+            Some("203.0.113.5".parse().unwrap()),
+            "the default must select the client, not the edge"
+        );
+    }
 
     fn cfg() -> Config {
         Config::new(
