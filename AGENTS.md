@@ -135,6 +135,43 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
 - Never refresh JWKS independently for every attacker-controlled unknown `kid`. Serialize refreshes and apply a short global cooldown while preserving normal key rotation.
 - Validating a URL's DNS result and then resolving it again during the request leaves a DNS-rebinding gap. Pin the validated socket addresses into the fetch client.
 - Treat every sender-controlled email field as untrusted, including subjects, display names, snippets, headers, and attachment filenames—not only the message body.
+- **`token_hash` in the audit log identifies a credential, not a client, and in
+  this deployment it is a constant.** Every session that mounts jmap-mcp
+  presents the same bearer: `honoka`, `lucy`, `mantis` and `penny` all mount it
+  from `~/Smithy/<name>_agent/wt/main/src/mcp.json` (`vryan` mounts `hevy` and
+  no jmap, so the check can return a negative). Measured 2026-08-27 across ten
+  audit lines from three separate occasions and at least two sessions:
+  **1 distinct `token_hash`, and `user` `julian@kampong.social` on all of
+  them.**
+
+  That is not wrong data; it is non-discriminating data in the shape of
+  discriminating data, which is worse than an absent field. During an incident
+  a reader pairs `token_hash` with `user`, sees two identical hashes, and
+  concludes they have separated or joined two callers. **The field can say
+  which credential was used and cannot say who used it.** Per-session
+  attribution would be a bearer-per-agent decision and is not this repository's
+  to make.
+
+- **A request count in this log is not a call count.** One
+  `mcp__jmap__whoami` produced **seven** authenticated requests, at
+  2026-08-27T04:12:08.290281Z through .347111Z, 57 ms apart end to end. The
+  `ingress chain length` line fires once per authenticated HTTP request, and
+  streamable-http turns one MCP tool call into a whole exchange. Reading nine
+  requests as nine actions is out by most of an order of magnitude, and the
+  same applies to any rate or volume conclusion drawn from these lines.
+
+- **The logs are JSON, so a `key=value` grep matches nothing while the pod is
+  logging normally.** `JMAP_MCP_LOG_FORMAT=json` in the Deployment, and fields
+  land as `"trusted_proxy_hops":2`, never `trusted_proxy_hops=2`. Measured on a
+  pod mid-flight:
+
+      grep 'trusted_proxy_hops=[0-9]'   0 matches
+      grep '"trusted_proxy_hops":'      9 matches
+
+  A zero here reads as "the feature is not running" rather than "my pattern is
+  wrong", which is how it cost a fleet sweep three pods. Quote a line as it
+  lands rather than as a tool rendered it: `jq -r '"a=\(.x)"'` output is a
+  rendering, and pasting it into a grep is how the wrong pattern gets built.
 - JMAP queries are paginated. Operations described as affecting an entire mailbox must loop until a confirming empty query and must surface partial `Email/set` failures.
 - Preserve the distinction between unsupported JMAP capabilities and authentication, transport, or backend failures; never collapse every method error into “unsupported.”
 - Best-effort optional JMAP methods may ignore only explicit unsupported-method/capability errors. Never swallow authentication, transport, or upstream failures as an empty optional result.
