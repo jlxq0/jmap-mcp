@@ -60,6 +60,19 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   Nothing says that grant is permanent: read `last_error` after the next
   workflow edit instead of assuming.
 
+- **`main` requires `CI / cargo*`, and excludes `CI / docker` on purpose.** The
+  `docker` job carries `needs: cargo` (`.forgejo/workflows/ci.yml:74`), and a
+  Forgejo job skipped because the job it needs failed still posts **`success`**
+  to the commit status, with no docker task created for that sha at all.
+  Measured here on six commits spanning 2026-08-16 to 2026-08-25 and across both
+  event types: every one had `cargo=failure` beside `docker=success`, among them
+  `83396b91` on `main` and `53bd20a5` on PR #10. Requiring `CI / docker` would
+  therefore build a gate that a commit where nothing was built satisfies. The
+  required context is a glob because the event suffix differs: a branch push
+  posts `CI / cargo (push)` and a pull-request head posts
+  `CI / cargo (pull_request)`. Do not tidy this up by adding `docker` to the
+  required contexts; the rule shows what is required and cannot show why.
+
 - A cache is not capped merely because expired entries are swept at a threshold. If every entry is still live, insertion can exceed the threshold; enforce a hard bound and test it with more than the configured capacity.
 - Never refresh JWKS independently for every attacker-controlled unknown `kid`. Serialize refreshes and apply a short global cooldown while preserving normal key rotation.
 - Validating a URL's DNS result and then resolving it again during the request leaves a DNS-rebinding gap. Pin the validated socket addresses into the fetch client.
