@@ -95,6 +95,27 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   `mergeable` note above: a field that answers a different question than the
   one asked, in the place everyone looks.
 
+- **A required status context can be created and then never resolved, and the
+  merge is blocked for as long as it is.** PR #16 opened 2026-08-27T02:27:23Z
+  with `CI / cargo (pull_request)`, `CI / docker (pull_request)` and
+  `CI / tag-ancestry (pull_request)` all `pending`, and **no workflow run was
+  ever scheduled for it**: 20 minutes later the task list's newest entry still
+  predated the PR. PR #15, seventeen minutes earlier, had its run 68 seconds
+  after opening. `POST /pulls/16/merge` returned 405
+  `Not all required status checks successful`, correctly, and would have done
+  so indefinitely. A pending required context is not always a queue; check
+  whether a run exists before waiting on one, and push a fresh commit to
+  re-trigger.
+
+- **Three further ways a gate's state stops being about the code**, all
+  answered by the workflow's `on:` block and none of them by the statuses on
+  past commits: a job skipped because its `needs:` failed posts `success`
+  without doing the work; a workflow with no `pull_request` trigger posts
+  nothing at all on a PR head; a repository with no PR history has never
+  produced its PR contexts, so their absence says nothing about whether it
+  would. Reading a `(push)`-only status history as evidence that a job is
+  push-only is the mistake this prevents. Read `on:`.
+
 - A cache is not capped merely because expired entries are swept at a threshold. If every entry is still live, insertion can exceed the threshold; enforce a hard bound and test it with more than the configured capacity.
 - Never refresh JWKS independently for every attacker-controlled unknown `kid`. Serialize refreshes and apply a short global cooldown while preserving normal key rotation.
 - Validating a URL's DNS result and then resolving it again during the request leaves a DNS-rebinding gap. Pin the validated socket addresses into the fetch client.
