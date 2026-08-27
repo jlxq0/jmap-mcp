@@ -141,6 +141,35 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
 - Sender-controlled structured headers such as Message-ID, In-Reply-To, and References need the same recursive sanitization and suspicious-content checks as subjects and display names.
 - DNS pinning is ineffective when an environment-configured proxy resolves the target hostname; SSRF-guarded one-off fetch clients must bypass proxies.
 - A clean RustSec audit does not cover the runtime base image. Scan the final container, keep the distroless digest current, and block releases on fixed HIGH/CRITICAL OS-package vulnerabilities.
+- **`docker manifest inspect -v` on an image *index* returns an array of
+  per-platform manifests, and `[0].Descriptor.digest` is not what a pod's
+  `imageID` carries.** The fleet rule says to use `-v` and read
+  `Descriptor.digest`, which is right for a single-manifest image and wrong
+  here: every `jmap-mcp` tag is an
+  `application/vnd.oci.image.index.v1+json`. Calibrated 2026-08-27 against
+  `v0.2.14`, whose deployed `imageID` is known:
+
+      pod imageID                         sha256:316e64a8…
+      registry HEAD Docker-Content-Digest sha256:316e64a8…   <- match, the index
+      manifest inspect -v [0].Descriptor  sha256:50831874…   <- linux/amd64 manifest
+
+  The array holds `[linux/amd64]` and an `[unknown/unknown]` attestation entry;
+  neither is the index. So the check is a registry `HEAD` on
+  `/v2/jlxq0/jmap-mcp/manifests/<tag>` with the index media types in `Accept`,
+  reading `Docker-Content-Digest`. That needs a **registry** token from
+  `/v2/token`, not the Forgejo API token.
+
+  This fails in the direction that looks like a rollback: comparing a platform
+  manifest against a correctly deployed `imageID` reports a mismatch on a
+  healthy image. It was caught only by running both methods against a tag whose
+  answer was already known, which is the point of dry-running a check against
+  a known state before the moment it matters.
+
+  Why the fleet rule reads as it does: measured across the five deployed MCP
+  servers, `caldav-mcp`, `hevy-mcp`, `matrix-mcp` and `typst-mcp` all publish a
+  **single** manifest, where `-v` returns an object and the rule is correct.
+  `jmap-mcp` is the only index among them, so the precondition had never been
+  visible. Do not "simplify" this entry back to the fleet form.
 - A shell-level `RUSTUP_TOOLCHAIN` overrides `rust-toolchain.toml`. Verify the exact MSRV in CI, and pair version-new Clippy allowances with `unknown_lints` so the pinned compiler can still build.
 - **`RUSTUP_TOOLCHAIN` unset is not enough: mise's `rustc` shim resolves
   `stable` and ignores `rust-toolchain.toml`.** Measured 2026-08-27 with
