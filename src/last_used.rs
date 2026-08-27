@@ -130,6 +130,33 @@ impl LastUsedTracker {
 /// Returns `None` when the header is absent, has fewer entries than
 /// the trusted-hops count, or contains no parseable IP at the trusted
 /// position.
+/// Number of comma-separated entries in an `X-Forwarded-For` header.
+///
+/// This is the ingress chain length as the pod sees it, and it is what
+/// `JMAP_MCP_TRUSTED_PROXY_HOPS` has to agree with: `parse_client_ip` counts
+/// in from the right, so a hop count one too low records the *proxy's*
+/// address as the client's in the audit trail. An absent field is
+/// recoverable; a confident wrong address in a provenance record is not.
+///
+/// Only the count is ever derived here. The entries are sender-influenced and
+/// identify people, so they must not reach a log line; the count decides the
+/// configuration and carries no identity.
+///
+/// Takes the raw header bytes rather than `&str`: a non-UTF-8 header would
+/// otherwise fail `to_str()` and count 0, which is indistinguishable from the
+/// header being absent. A measurement that reports the same value for "no
+/// proxy" and "unreadable" cannot settle the question it exists to answer.
+/// An empty or whitespace-only value is 0 entries, not 1.
+#[must_use]
+pub fn xff_entry_count(xff: Option<&[u8]>) -> usize {
+    xff.map_or(0, |raw| {
+        if raw.iter().all(u8::is_ascii_whitespace) {
+            return 0;
+        }
+        raw.split(|b| *b == b',').count()
+    })
+}
+
 #[must_use]
 pub fn parse_client_ip(xff: Option<&str>, trusted_proxy_hops: usize) -> Option<IpAddr> {
     let raw = xff?;
@@ -193,6 +220,48 @@ mod tests {
         );
         // `ip` should be present and null.
         assert_eq!(json.get("ip").unwrap(), &serde_json::Value::Null);
+    }
+
+    #[test]
+    fn xff_entry_count_counts_entries_not_bytes() {
+        assert_eq!(xff_entry_count(None), 0);
+        assert_eq!(xff_entry_count(Some(b"203.0.113.5")), 1);
+        assert_eq!(xff_entry_count(Some(b"203.0.113.5, 10.0.0.1")), 2);
+        assert_eq!(xff_entry_count(Some(b"203.0.113.5, 10.0.0.1, 10.0.0.2")), 3);
+        // Whitespace-only spellings must not change the count.
+        assert_eq!(xff_entry_count(Some(b"203.0.113.5,10.0.0.1")), 2);
+    }
+
+    #[test]
+    fn xff_entry_count_distinguishes_absent_from_unreadable_and_empty() {
+        // The whole point is settling the chain length, so the three cases a
+        // careless implementation collapses to 0 must stay apart.
+        assert_eq!(xff_entry_count(None), 0, "absent");
+        assert_eq!(xff_entry_count(Some(b"")), 0, "empty");
+        assert_eq!(xff_entry_count(Some(b"   ")), 0, "whitespace only");
+        // Non-UTF-8 would count 0 through `to_str().ok()`; on raw bytes the
+        // chain length is still reported.
+        assert_eq!(xff_entry_count(Some(&[0xff, b',', 0xfe])), 2, "non-UTF-8");
+    }
+
+    #[test]
+    fn xff_entry_count_matches_what_parse_client_ip_indexes() {
+        // The count is only useful if it is the same `len` parse_client_ip
+        // divides by. With count == hops, index 0 is selected: the leftmost
+        // entry, which is the client. With hops one too low, the entry to its
+        // right is selected instead -- the proxy.
+        let xff = "203.0.113.5, 10.0.0.1";
+        assert_eq!(xff_entry_count(Some(xff.as_bytes())), 2);
+        assert_eq!(
+            parse_client_ip(Some(xff), 2),
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))),
+            "hops == chain length selects the client"
+        );
+        assert_eq!(
+            parse_client_ip(Some(xff), 1),
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            "hops one too low records the proxy as the client"
+        );
     }
 
     #[test]

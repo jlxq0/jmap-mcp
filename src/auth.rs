@@ -12,7 +12,7 @@ use axum::http::{HeaderValue, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use subtle::ConstantTimeEq;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::audit::{self, outcome};
 use crate::config::Config;
@@ -69,13 +69,19 @@ pub async fn bearer_auth(
                 identity.email.as_deref(),
             );
             if !is_introspect_path {
-                let client_ip = last_used::parse_client_ip(
-                    request
-                        .headers()
-                        .get("x-forwarded-for")
-                        .and_then(|v| v.to_str().ok()),
-                    state.config.trusted_proxy_hops,
+                let xff_raw = request.headers().get("x-forwarded-for");
+                let xff = xff_raw.and_then(|v| v.to_str().ok());
+                // Count only, never the entries: they are sender-influenced
+                // and identify people. The count is what `trusted_proxy_hops`
+                // must agree with, and nothing else reports the chain length
+                // the pod actually sees.
+                info!(
+                    xff_entries =
+                        last_used::xff_entry_count(xff_raw.map(axum::http::HeaderValue::as_bytes)),
+                    trusted_proxy_hops = state.config.trusted_proxy_hops,
+                    "ingress chain length"
                 );
+                let client_ip = last_used::parse_client_ip(xff, state.config.trusted_proxy_hops);
                 state.last_used.record(&token_hash, client_ip);
             }
             // The rmcp streamable-http tower layer copies the request `Parts`
