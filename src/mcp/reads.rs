@@ -197,11 +197,15 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL],
                     vec![(
                         "Mailbox/get",
@@ -269,7 +273,11 @@ impl JmapMcpService {
         let (mut result, count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
             let limit = capped_email_limit(params.limit);
 
             let mut filter = json!({ "text": params.query });
@@ -281,7 +289,7 @@ impl JmapMcpService {
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL],
                     vec![
                         (
@@ -326,7 +334,7 @@ impl JmapMcpService {
             // failures must still reach the caller.
             let snippets = self
                 .search_snippets(
-                    &token.0,
+                    &token.header_value(),
                     &account_id,
                     &params.query,
                     &ids,
@@ -414,14 +422,14 @@ impl JmapMcpService {
         let (mut result, count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self.jmap.account_id(&token.header_value()).await.map_err(map_jmap_err)?;
             let limit = capped_email_limit(params.limit) as usize;
 
             // Thread/get → Email/get on the thread's emailIds via back-ref.
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL],
                     vec![
                         (
@@ -533,14 +541,18 @@ impl JmapMcpService {
         let (mut result, count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
             let ids = params.mailbox_ids.as_ref().map_or(Value::Null, |v| {
                 Value::Array(v.iter().map(|s| Value::String(s.clone())).collect())
             });
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL],
                     vec![(
                         "Mailbox/get",
@@ -616,9 +628,15 @@ impl JmapMcpService {
         let (mut result, count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
             let limit = capped_email_limit(params.limit) as usize;
-            let mut list = self.all_mailboxes(&token.0, &account_id).await?;
+            let mut list = self
+                .all_mailboxes(&token.header_value(), &account_id)
+                .await?;
             // Sort by unread descending; cap to limit.
             list.sort_by(|a, b| {
                 let ua = a.get("unreadEmails").and_then(Value::as_u64).unwrap_or(0);
@@ -685,11 +703,11 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self.jmap.account_id(&token.header_value()).await.map_err(map_jmap_err)?;
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL],
                     vec![(
                         "Email/get",
@@ -784,11 +802,15 @@ impl JmapMcpService {
         let (mut result, count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL],
                     vec![(
                         "Email/get",

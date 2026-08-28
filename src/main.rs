@@ -89,6 +89,7 @@ fn build_app(cfg: Config) -> Result<Router> {
         config: cfg.clone(),
         logto: logto.clone(),
         last_used: last_used::LastUsedTracker::new(),
+        jmap: jmap.clone(),
     };
     let limiter = Arc::new(
         Limiter::new(cfg.rate_limit_reads_per_min, cfg.rate_limit_writes_per_min)
@@ -235,7 +236,7 @@ async fn initialize_rate_limit(
         )
             .into_response();
     };
-    let bearer_hash = crate::audit::token_hash(&token.0);
+    let bearer_hash = crate::audit::token_hash(token.secret());
     if limiter
         .check(&bearer_hash, Some(identity.user_id.as_str()))
         .is_err()
@@ -357,6 +358,7 @@ mod tests {
             config: cfg.clone(),
             logto: logto.clone(),
             last_used: crate::last_used::LastUsedTracker::new(),
+            jmap: jmap.clone(),
         };
         let limiter = Arc::new(crate::rate_limit::Limiter::new(100_000, 100_000).unwrap());
         build_router(

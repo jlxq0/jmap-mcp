@@ -125,6 +125,21 @@ const ENV_TRUSTED_PROXY_HOPS: &str = "JMAP_MCP_TRUSTED_PROXY_HOPS";
 /// `Host` = the public hostname (so TLS + JMAP session URLs stay valid) but
 /// dial the in-cluster Service `ClusterIP` on port 443.
 const ENV_STALWART_CONNECT_IP: &str = "JMAP_MCP_STALWART_CONNECT_IP";
+/// Opt in to accepting a Stalwart app password over HTTP Basic, in addition to
+/// the Logto JWT over Bearer.
+///
+/// **Off by default, and the default is the point.** Until this exists the
+/// server has only ever held a credential Logto validated. A Stalwart app
+/// password is long-lived and validated by the mail server instead, so turning
+/// it on is a deployment decision about that mailbox rather than a code one.
+///
+/// It does not make any bearer acceptable. `Bearer` remains Logto-JWT-only, so
+/// a garbage bearer takes exactly the path it took before this flag existed;
+/// `Basic` is a separate path that Stalwart itself accepts or refuses. The two
+/// never merge into "forwarded to Stalwart either way", which is how a
+/// validated credential and an unvalidated one become the same thing to the
+/// next reader.
+const ENV_ALLOW_APP_PASSWORD: &str = "JMAP_MCP_ALLOW_STALWART_APP_PASSWORD";
 
 /// Additional addresses this mailbox may send as, declared by the operator.
 ///
@@ -169,6 +184,9 @@ pub struct Config {
     pub upload_max_bytes: usize,
     /// Number of trusted proxies in front of jmap-mcp (X-Forwarded-For).
     pub trusted_proxy_hops: usize,
+    /// Accept a Stalwart app password over HTTP Basic. See
+    /// [`ENV_ALLOW_APP_PASSWORD`]. Default `false`.
+    pub allow_app_password: bool,
     /// Optional IP to dial for the Stalwart host (DNS override). `None` = use
     /// normal DNS resolution.
     pub stalwart_connect_ip: Option<String>,
@@ -226,6 +244,7 @@ impl Config {
             download_max_bytes: DEFAULT_DOWNLOAD_MAX_BYTES,
             upload_max_bytes: DEFAULT_UPLOAD_MAX_BYTES,
             trusted_proxy_hops: DEFAULT_TRUSTED_PROXY_HOPS,
+            allow_app_password: false,
             stalwart_connect_ip: None,
             dcr_client_id: None,
             oauth_redirect_uris: Vec::new(),
@@ -273,6 +292,7 @@ impl Config {
         )?)
         .unwrap_or(DEFAULT_UPLOAD_MAX_BYTES);
         cfg.trusted_proxy_hops = parse_trusted_proxy_hops()?;
+        cfg.allow_app_password = parse_bool_env(ENV_ALLOW_APP_PASSWORD)?;
         cfg.stalwart_connect_ip = std::env::var(ENV_STALWART_CONNECT_IP)
             .ok()
             .filter(|s| !s.trim().is_empty());
@@ -433,6 +453,20 @@ pub fn parse_extra_from_addresses(raw: &str) -> Result<Vec<String>> {
         }
     }
     Ok(out)
+}
+
+/// Parse a boolean env var. Absent is `false`; only the exact strings below are
+/// accepted, so a typo is an error rather than a silent `false` on a flag that
+/// widens the auth surface.
+fn parse_bool_env(name: &str) -> Result<bool> {
+    match std::env::var(name) {
+        Err(_) => Ok(false),
+        Ok(raw) => match raw.trim() {
+            "1" | "true" | "yes" => Ok(true),
+            "0" | "false" | "no" | "" => Ok(false),
+            other => anyhow::bail!("{name} must be one of 1/true/yes/0/false/no, got: {other}"),
+        },
+    }
 }
 
 fn parse_trusted_proxy_hops() -> Result<usize> {

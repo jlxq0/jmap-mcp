@@ -104,10 +104,14 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
             let updated = self
                 .email_set_update(
-                    &token.0,
+                    &token.header_value(),
                     &account_id,
                     &params.email_ids,
                     &json!({ "keywords/$seen": true }),
@@ -149,10 +153,14 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
             let updated = self
                 .email_set_update(
-                    &token.0,
+                    &token.header_value(),
                     &account_id,
                     &params.email_ids,
                     &json!({ "keywords/$seen": Value::Null }),
@@ -196,11 +204,20 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
             let kw = flag_keyword(&params.flag);
             let patch = json!({ format!("keywords/{kw}"): true });
             let updated = self
-                .email_set_update(&token.0, &account_id, &params.email_ids, &patch)
+                .email_set_update(
+                    &token.header_value(),
+                    &account_id,
+                    &params.email_ids,
+                    &patch,
+                )
                 .await?;
             structured_result(&FlagResult {
                 email_ids: params.email_ids.clone(),
@@ -241,11 +258,20 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
             let kw = flag_keyword(&params.flag);
             let patch = json!({ format!("keywords/{kw}"): Value::Null });
             let updated = self
-                .email_set_update(&token.0, &account_id, &params.email_ids, &patch)
+                .email_set_update(
+                    &token.header_value(),
+                    &account_id,
+                    &params.email_ids,
+                    &patch,
+                )
                 .await?;
             structured_result(&FlagResult {
                 email_ids: params.email_ids.clone(),
@@ -285,11 +311,20 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
             let kw = &params.keyword;
             let patch = json!({ format!("keywords/{kw}"): true });
             let updated = self
-                .email_set_update(&token.0, &account_id, &params.email_ids, &patch)
+                .email_set_update(
+                    &token.header_value(),
+                    &account_id,
+                    &params.email_ids,
+                    &patch,
+                )
                 .await?;
             structured_result(&KeywordResult {
                 email_ids: params.email_ids.clone(),
@@ -329,11 +364,20 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
             let kw = &params.keyword;
             let patch = json!({ format!("keywords/{kw}"): Value::Null });
             let updated = self
-                .email_set_update(&token.0, &account_id, &params.email_ids, &patch)
+                .email_set_update(
+                    &token.header_value(),
+                    &account_id,
+                    &params.email_ids,
+                    &patch,
+                )
                 .await?;
             structured_result(&KeywordResult {
                 email_ids: params.email_ids.clone(),
@@ -375,10 +419,19 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
             let patch = json!({ "mailboxIds": { params.target_mailbox_id.clone(): true } });
             let moved = self
-                .email_set_update(&token.0, &account_id, &params.email_ids, &patch)
+                .email_set_update(
+                    &token.header_value(),
+                    &account_id,
+                    &params.email_ids,
+                    &patch,
+                )
                 .await?;
             structured_result(&MoveResult {
                 email_ids: params.email_ids.clone(),
@@ -427,11 +480,20 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
             let tgt = &params.target_mailbox_id;
             let patch = json!({ format!("mailboxIds/{tgt}"): true });
             let copied = self
-                .email_set_update(&token.0, &account_id, &params.email_ids, &patch)
+                .email_set_update(
+                    &token.header_value(),
+                    &account_id,
+                    &params.email_ids,
+                    &patch,
+                )
                 .await?;
             structured_result(&CopyResult {
                 email_ids: params.email_ids.clone(),

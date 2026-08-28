@@ -28,6 +28,23 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   redirect URI policy once the transparent proxy rewrites `redirect_uri`.
   Found 2026-06: authorization-code theft via attacker-controlled callback.
 
+- **Stalwart answers a request with *no* `Authorization` header with `200`,
+  not `401`, and the body parses cleanly into `JmapSession`.** Only a *bad*
+  credential gives 401. Measured on `jmap.kampong.social` 2026-08-28:
+
+      no Authorization header   200, 1297-byte capabilities document
+      garbage Basic             401
+      garbage Bearer            401
+
+  The 200 body carries `apiUrl`, `downloadUrl`, `uploadUrl`, `primaryAccounts`
+  `{}` and `username` `""`, so a session fetch that forgets to attach the
+  credential returns **`Ok`**, the authentication step succeeds, and the failure
+  surfaces somewhere else entirely as a missing account. **"The session fetch
+  returned 200" is therefore not proof of authentication**, and it is the first
+  predicate anyone writing credential validation against this backend reaches
+  for. Use `JmapSession::is_authenticated`: 200 **and** a non-empty `username`
+  or a real entry in `primaryAccounts`.
+
 - **A JSON shape asserted only against a hand-written fixture is not tested.**
   `aliases_of` read Stalwart's `aliases` as an object map; the real schema is a
   **list**, so `as_object()` returned `None` and the mailbox's aliases silently

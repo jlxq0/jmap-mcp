@@ -89,7 +89,11 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
 
             let mut create = json!({ "name": params.name });
             if let Some(parent) = &params.parent_id {
@@ -99,7 +103,7 @@ impl JmapMcpService {
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL],
                     vec![(
                         "Mailbox/set",
@@ -158,12 +162,16 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
 
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL],
                     vec![(
                         "Mailbox/set",
@@ -231,12 +239,16 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
 
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL],
                     vec![(
                         "Mailbox/set",
@@ -342,12 +354,16 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
 
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL],
                     vec![(
                         "Mailbox/set",

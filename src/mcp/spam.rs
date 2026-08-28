@@ -64,13 +64,24 @@ impl JmapMcpService {
                 ));
             }
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
-            let mailboxes = self.all_mailboxes(&token.0, &account_id).await?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
+            let mailboxes = self
+                .all_mailboxes(&token.header_value(), &account_id)
+                .await?;
             let junk = Self::role_mailbox(&mailboxes, "junk")
                 .ok_or_else(|| ErrorData::invalid_params("no Junk mailbox found", None))?;
             let patch = json!({ "mailboxIds": { junk: true } });
             let moved_to_spam = self
-                .replace_mailboxes(&token.0, &account_id, &params.email_ids, &patch)
+                .replace_mailboxes(
+                    &token.header_value(),
+                    &account_id,
+                    &params.email_ids,
+                    &patch,
+                )
                 .await?;
             structured_result(&MarkAsSpamResult {
                 email_ids: params.email_ids.clone(),
@@ -115,13 +126,24 @@ impl JmapMcpService {
                 ));
             }
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
-            let mailboxes = self.all_mailboxes(&token.0, &account_id).await?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
+            let mailboxes = self
+                .all_mailboxes(&token.header_value(), &account_id)
+                .await?;
             let inbox = Self::role_mailbox(&mailboxes, "inbox")
                 .ok_or_else(|| ErrorData::invalid_params("no Inbox mailbox found", None))?;
             let patch = json!({ "mailboxIds": { inbox: true } });
             let moved_from_spam = self
-                .replace_mailboxes(&token.0, &account_id, &params.email_ids, &patch)
+                .replace_mailboxes(
+                    &token.header_value(),
+                    &account_id,
+                    &params.email_ids,
+                    &patch,
+                )
                 .await?;
             structured_result(&MarkAsNotSpamResult {
                 email_ids: params.email_ids.clone(),

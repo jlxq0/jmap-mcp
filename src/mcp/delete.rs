@@ -93,8 +93,14 @@ impl JmapMcpService {
                 ));
             }
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
-            let mailboxes = self.all_mailboxes(&token.0, &account_id).await?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
+            let mailboxes = self
+                .all_mailboxes(&token.header_value(), &account_id)
+                .await?;
             let trash = Self::role_mailbox(&mailboxes, "trash")
                 .ok_or_else(|| ErrorData::internal_error("no Trash mailbox found", None))?;
 
@@ -106,7 +112,7 @@ impl JmapMcpService {
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL],
                     vec![(
                         "Email/set",
@@ -166,12 +172,16 @@ impl JmapMcpService {
                 ));
             }
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
 
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL],
                     vec![(
                         "Email/set",
@@ -232,11 +242,19 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
-            let mailboxes = self.all_mailboxes(&token.0, &account_id).await?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
+            let mailboxes = self
+                .all_mailboxes(&token.header_value(), &account_id)
+                .await?;
             let trash = Self::role_mailbox(&mailboxes, "trash")
                 .ok_or_else(|| ErrorData::internal_error("no Trash mailbox found", None))?;
-            let destroyed = self.empty_mailbox(&token.0, &account_id, &trash).await?;
+            let destroyed = self
+                .empty_mailbox(&token.header_value(), &account_id, &trash)
+                .await?;
             structured_result(&EmptyMailboxResult {
                 destroyed_count: destroyed,
             })
@@ -272,11 +290,19 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
-            let mailboxes = self.all_mailboxes(&token.0, &account_id).await?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
+            let mailboxes = self
+                .all_mailboxes(&token.header_value(), &account_id)
+                .await?;
             let junk = Self::role_mailbox(&mailboxes, "junk")
                 .ok_or_else(|| ErrorData::internal_error("no Spam mailbox found", None))?;
-            let destroyed = self.empty_mailbox(&token.0, &account_id, &junk).await?;
+            let destroyed = self
+                .empty_mailbox(&token.header_value(), &account_id, &junk)
+                .await?;
             structured_result(&EmptyMailboxResult {
                 destroyed_count: destroyed,
             })

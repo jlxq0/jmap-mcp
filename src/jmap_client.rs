@@ -70,6 +70,23 @@ impl JmapSession {
     pub fn mail_account_id(&self) -> Option<&str> {
         self.primary_accounts.get(CAP_MAIL).map(String::as_str)
     }
+
+    /// Whether this session belongs to somebody.
+    ///
+    /// Stalwart returns **200** with a capabilities-only document when no
+    /// `Authorization` header is sent at all, and that document parses into
+    /// this struct without error: `primary_accounts` `{}` and `username` `""`.
+    /// So "the fetch succeeded" cannot distinguish a valid credential from a
+    /// forgotten one, and this is the predicate that can. Measured against
+    /// `jmap.kampong.social` 2026-08-28.
+    #[must_use]
+    pub fn is_authenticated(&self) -> bool {
+        !self.primary_accounts.is_empty()
+            || self
+                .username
+                .as_deref()
+                .is_some_and(|u| !u.trim().is_empty())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -133,7 +150,19 @@ impl JmapClient {
         })
     }
 
-    /// Fetch (and cache) the JMAP Session for this token.
+    /// Fetch (and cache) the JMAP Session for this credential.
+    ///
+    /// `token` is the **complete `Authorization` header value**, scheme
+    /// included, as produced by `AccessToken::header_value`. Every method here
+    /// takes it in that form so that no call site chooses a scheme and a
+    /// Stalwart app password can never go out as `Bearer`.
+    ///
+    /// **A success here is not proof of authentication.** Stalwart answers an
+    /// *absent* `Authorization` header with **200** and a capabilities-only
+    /// document that deserialises cleanly into [`JmapSession`], with empty
+    /// `primary_accounts` and an empty `username`. Only a *bad* credential
+    /// gives 401. Use [`JmapSession::is_authenticated`] before treating a
+    /// session as evidence that a credential is good.
     pub async fn session_for(&self, token: &str) -> Result<JmapSession, JmapError> {
         let key = hash_token(token);
         if let Some(s) = self.session_lookup(&key) {
@@ -142,7 +171,7 @@ impl JmapClient {
         let resp = self
             .http
             .get(&self.discovery_url)
-            .bearer_auth(token)
+            .header(reqwest::header::AUTHORIZATION, token)
             .send()
             .await?;
         let status = resp.status();
@@ -194,7 +223,7 @@ impl JmapClient {
         let resp = self
             .http
             .post(&session.api_url)
-            .bearer_auth(token)
+            .header(reqwest::header::AUTHORIZATION, token)
             .json(&body)
             .send()
             .await?;
@@ -269,7 +298,12 @@ impl JmapClient {
             content_type,
             name,
         );
-        let resp = self.http.get(&url).bearer_auth(token).send().await?;
+        let resp = self
+            .http
+            .get(&url)
+            .header(reqwest::header::AUTHORIZATION, token)
+            .send()
+            .await?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             self.evict(token);
@@ -308,7 +342,7 @@ impl JmapClient {
         let resp = self
             .http
             .post(&url)
-            .bearer_auth(token)
+            .header(reqwest::header::AUTHORIZATION, token)
             .header(reqwest::header::CONTENT_TYPE, content_type)
             .body(bytes)
             .send()
@@ -434,6 +468,72 @@ pub fn log_set_failures(method: &str, payload: &Value) {
 mod tests {
     use super::*;
 
+    /// Stalwart answers a request carrying **no** `Authorization` header with
+    /// 200 and this body. It deserialises without error, so `session_for`
+    /// returns `Ok` and a validator built on "the fetch succeeded" would
+    /// authenticate a request whose credential was never attached.
+    ///
+    /// Captured from `https://jmap.kampong.social/jmap/session` on 2026-08-28.
+    const UNAUTHENTICATED_SESSION: &str = r#"{
+        "apiUrl": "https://jmap.kampong.social/jmap/",
+        "downloadUrl": "https://jmap.kampong.social/jmap/download/{accountId}/{blobId}/{name}",
+        "uploadUrl": "https://jmap.kampong.social/jmap/upload/{accountId}/",
+        "primaryAccounts": {},
+        "username": ""
+    }"#;
+
+    #[test]
+    fn the_unauthenticated_session_parses_but_is_not_authenticated() {
+        let s: JmapSession = serde_json::from_str(UNAUTHENTICATED_SESSION)
+            .expect("Stalwart's no-credential 200 body must still parse; that is the trap");
+        assert!(
+            !s.is_authenticated(),
+            "a session with no account and no username belongs to nobody"
+        );
+        assert_eq!(s.mail_account_id(), None);
+    }
+
+    #[test]
+    fn a_real_session_is_authenticated() {
+        let raw = r#"{
+            "apiUrl": "https://example.test/jmap/",
+            "downloadUrl": "d",
+            "uploadUrl": "u",
+            "primaryAccounts": {"urn:ietf:params:jmap:mail": "acct-1"},
+            "username": "lucy@example.test"
+        }"#;
+        let s: JmapSession = serde_json::from_str(raw).unwrap();
+        assert!(s.is_authenticated());
+    }
+
+    /// Either signal alone is enough, so a backend that reports only one of
+    /// them still authenticates.
+    #[test]
+    fn either_account_or_username_is_enough() {
+        let account_only = r#"{"apiUrl":"a","downloadUrl":"d","uploadUrl":"u",
+            "primaryAccounts":{"urn:ietf:params:jmap:mail":"x"},"username":""}"#;
+        let username_only = r#"{"apiUrl":"a","downloadUrl":"d","uploadUrl":"u",
+            "primaryAccounts":{},"username":"someone@example.test"}"#;
+        let blank_username = r#"{"apiUrl":"a","downloadUrl":"d","uploadUrl":"u",
+            "primaryAccounts":{},"username":"   "}"#;
+        assert!(
+            serde_json::from_str::<JmapSession>(account_only)
+                .unwrap()
+                .is_authenticated()
+        );
+        assert!(
+            serde_json::from_str::<JmapSession>(username_only)
+                .unwrap()
+                .is_authenticated()
+        );
+        assert!(
+            !serde_json::from_str::<JmapSession>(blank_username)
+                .unwrap()
+                .is_authenticated(),
+            "whitespace is not a username"
+        );
+    }
+
     #[test]
     fn download_url_template_expands() {
         let u = expand_download_url(
@@ -494,13 +594,17 @@ mod tests {
             .mount(&server)
             .await;
 
+        // The credential is now the COMPLETE header value, scheme included,
+        // so the scheme cannot be chosen at a call site. The mock asserts the
+        // exact bytes that go on the wire.
         let client = JmapClient::new(&server.uri(), None).unwrap();
-        let session = client.session_for("live-token").await.unwrap();
+        let session = client.session_for("Bearer live-token").await.unwrap();
 
+        assert!(session.is_authenticated());
         assert_eq!(session.username.as_deref(), Some("julian@kampong.social"));
         assert_eq!(session.mail_account_id(), Some("acct-1"));
         assert_eq!(
-            client.account_id("live-token").await.unwrap(),
+            client.account_id("Bearer live-token").await.unwrap(),
             "acct-1".to_owned()
         );
     }

@@ -35,6 +35,11 @@ pub struct TokenIntrospectResponse {
     pub token_hash: String,
     /// Most recent activity for this bearer.
     pub last_used: Option<LastUsedRecord>,
+    /// Which credential authenticated this request, `Bearer` for a Logto JWT
+    /// or `Basic` for a Stalwart app password. Reported because the two are
+    /// forwarded to Stalwart alike and only one of them was checked against
+    /// Logto; a caller auditing its own session should not have to infer it.
+    auth_method: &'static str,
 }
 
 #[allow(clippy::unused_async)] // axum handlers must be async
@@ -53,7 +58,7 @@ pub async fn handler(State(state): State<AuthState>, request: Request) -> Respon
         )
             .into_response();
     };
-    let token_hash = audit::token_hash(&token.0);
+    let token_hash = audit::token_hash(token.secret());
     let last_used = state.last_used.get(&token_hash);
     Json(TokenIntrospectResponse {
         user_id: identity.user_id,
@@ -62,6 +67,7 @@ pub async fn handler(State(state): State<AuthState>, request: Request) -> Respon
         exp: identity.exp,
         token_hash,
         last_used,
+        auth_method: token.scheme().as_str(),
     })
     .into_response()
 }
