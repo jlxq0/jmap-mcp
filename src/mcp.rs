@@ -891,11 +891,78 @@ pub struct SendEmailParams {
     #[serde(default)]
     pub bcc: Vec<String>,
     pub subject: String,
-    /// Plain-text body.
+    /// Plain-text body. Always required, including when `body_html` is given:
+    /// it is what a client that will not render HTML shows.
     pub body_text: String,
+    /// Optional HTML body. When present the email carries both, as
+    /// `textBody` and `htmlBody` with distinct part ids, and the client
+    /// chooses. Absent, the request is byte-identical to a text-only send.
+    ///
+    /// Composed by the calling agent rather than received from anyone, so it
+    /// is not sanitised on the way out. That is the same distinction
+    /// `read_email` draws when it wraps inbound content: sanitising outbound
+    /// markup would corrupt legitimate styling for no threat model.
+    #[serde(default)]
+    pub body_html: Option<String>,
     /// Optional Message-ID this email is replying to (sets In-Reply-To).
     #[serde(default)]
     pub in_reply_to: Option<String>,
+}
+
+/// Refuse an HTML body with no plain-text alternative.
+///
+/// A briefing that arrives blank on a client that will not render HTML is
+/// worse than an unstyled one, and a caller composing the HTML is exactly the
+/// caller who will forget the fallback. Structural rather than left to
+/// whoever composes.
+fn validate_send_bodies(params: &SendEmailParams) -> Result<(), ErrorData> {
+    if params.body_html.is_some() && params.body_text.trim().is_empty() {
+        return Err(ErrorData::invalid_params(
+            "body_html requires a non-empty body_text: clients that do not render HTML \
+             would show an empty message",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Build the JMAP `Email` object for a send.
+///
+/// Extracted so the wire shape can be asserted without a mail server. The
+/// no-HTML branch must stay byte-identical to what was sent before
+/// `body_html` existed, which is a property a test can hold and a reading
+/// cannot.
+fn build_email_object(params: &SendEmailParams, drafts: &str, from_header: &Value) -> Value {
+    let to_addrs: Vec<Value> = params.to.iter().map(|e| json!({ "email": e })).collect();
+    let cc_addrs: Vec<Value> = params.cc.iter().map(|e| json!({ "email": e })).collect();
+    let bcc_addrs: Vec<Value> = params.bcc.iter().map(|e| json!({ "email": e })).collect();
+
+    let mut email_obj = json!({
+        "mailboxIds": { drafts.to_owned(): true },
+        "keywords": { "$draft": true, "$seen": true },
+        "from": [ from_header ],
+        "to": to_addrs,
+        "subject": params.subject,
+        "bodyValues": { "b": { "value": params.body_text, "isTruncated": false } },
+        "textBody": [ { "partId": "b", "type": "text/plain" } ]
+    });
+    if let Some(html) = &params.body_html {
+        // Distinct part ids: one bodyValue per part, and each of textBody and
+        // htmlBody naming its own. Sharing an id would make the two bodies the
+        // same part and the client would render whichever it found first.
+        email_obj["bodyValues"]["h"] = json!({ "value": html, "isTruncated": false });
+        email_obj["htmlBody"] = json!([ { "partId": "h", "type": "text/html" } ]);
+    }
+    if !cc_addrs.is_empty() {
+        email_obj["cc"] = Value::Array(cc_addrs);
+    }
+    if !bcc_addrs.is_empty() {
+        email_obj["bcc"] = Value::Array(bcc_addrs);
+    }
+    if let Some(irt) = &params.in_reply_to {
+        email_obj["inReplyTo"] = json!([irt]);
+    }
+    email_obj
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -1331,6 +1398,7 @@ impl JmapMcpService {
         let span = make_tool_span("send_email", &user, None);
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
+            validate_send_bodies(&params)?;
             if params.to.is_empty() {
                 return Err(ErrorData::invalid_params("`to` must not be empty", None));
             }
@@ -1361,28 +1429,7 @@ impl JmapMcpService {
                 )
                 .await?;
 
-            let to_addrs: Vec<Value> = params.to.iter().map(|e| json!({ "email": e })).collect();
-            let cc_addrs: Vec<Value> = params.cc.iter().map(|e| json!({ "email": e })).collect();
-            let bcc_addrs: Vec<Value> = params.bcc.iter().map(|e| json!({ "email": e })).collect();
-
-            let mut email_obj = json!({
-                "mailboxIds": { drafts.clone(): true },
-                "keywords": { "$draft": true, "$seen": true },
-                "from": [ from.header() ],
-                "to": to_addrs,
-                "subject": params.subject,
-                "bodyValues": { "b": { "value": params.body_text, "isTruncated": false } },
-                "textBody": [ { "partId": "b", "type": "text/plain" } ]
-            });
-            if !cc_addrs.is_empty() {
-                email_obj["cc"] = Value::Array(cc_addrs);
-            }
-            if !bcc_addrs.is_empty() {
-                email_obj["bcc"] = Value::Array(bcc_addrs);
-            }
-            if let Some(irt) = &params.in_reply_to {
-                email_obj["inReplyTo"] = json!([irt]);
-            }
+            let email_obj = build_email_object(&params, &drafts, &from.header());
 
             // onSuccessUpdateEmail: clear $draft, mark $seen, move to Sent.
             let mut patch = json!({ "keywords/$draft": null, "keywords/$seen": true });
@@ -1774,6 +1821,106 @@ impl ServerHandler for JmapMcpService {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn send_params(body_text: &str, body_html: Option<&str>) -> SendEmailParams {
+        SendEmailParams {
+            from: "lucy@lindner.earth".into(),
+            to: vec!["julian@lindner.earth".into()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "Briefing".into(),
+            body_text: body_text.into(),
+            body_html: body_html.map(ToOwned::to_owned),
+            in_reply_to: None,
+        }
+    }
+
+    /// Omitting `body_html` must produce the object this tool sent before the
+    /// parameter existed. Written as the whole object rather than as spot
+    /// checks, because the claim is "byte-identical" and a spot check cannot
+    /// hold it: an extra key would pass every assertion about the keys named.
+    #[test]
+    fn without_html_the_object_is_unchanged() {
+        let obj = build_email_object(
+            &send_params("plain only", None),
+            "mb-drafts",
+            &json!({ "email": "lucy@lindner.earth" }),
+        );
+        assert_eq!(
+            obj,
+            json!({
+                "mailboxIds": { "mb-drafts": true },
+                "keywords": { "$draft": true, "$seen": true },
+                "from": [ { "email": "lucy@lindner.earth" } ],
+                "to": [ { "email": "julian@lindner.earth" } ],
+                "subject": "Briefing",
+                "bodyValues": { "b": { "value": "plain only", "isTruncated": false } },
+                "textBody": [ { "partId": "b", "type": "text/plain" } ]
+            })
+        );
+    }
+
+    /// Both bodies go out with distinct part ids, `textBody` naming the plain
+    /// one and `htmlBody` the HTML one. Sharing an id would make them the same
+    /// part and the client would render whichever it found first.
+    #[test]
+    fn with_html_both_bodies_go_out_with_distinct_part_ids() {
+        let obj = build_email_object(
+            &send_params("plain fallback", Some("<h1>Briefing</h1>")),
+            "mb-drafts",
+            &json!({ "email": "lucy@lindner.earth" }),
+        );
+
+        let values = obj["bodyValues"].as_object().expect("bodyValues object");
+        assert_eq!(values.len(), 2, "one bodyValue per part");
+
+        let text_part = obj["textBody"][0]["partId"].as_str().unwrap();
+        let html_part = obj["htmlBody"][0]["partId"].as_str().unwrap();
+        assert_ne!(text_part, html_part, "the two parts must not share an id");
+
+        assert_eq!(values[text_part]["value"], "plain fallback");
+        assert_eq!(values[html_part]["value"], "<h1>Briefing</h1>");
+        assert_eq!(obj["textBody"][0]["type"], "text/plain");
+        assert_eq!(obj["htmlBody"][0]["type"], "text/html");
+    }
+
+    /// The HTML is not sanitised on the way out. It is composed by the calling
+    /// agent rather than received from anyone, which is the distinction
+    /// `read_email`'s wrapping already draws, and rewriting it would corrupt
+    /// legitimate markup.
+    #[test]
+    fn outbound_html_is_passed_through_unaltered() {
+        let html = r#"<div style="color:#0a0"><a href="https://x.test?a=1&b=2">go</a></div>"#;
+        let obj = build_email_object(
+            &send_params("t", Some(html)),
+            "d",
+            &json!({ "email": "a@b.test" }),
+        );
+        let part = obj["htmlBody"][0]["partId"].as_str().unwrap();
+        assert_eq!(obj["bodyValues"][part]["value"], html);
+    }
+
+    /// HTML with an empty text body is refused rather than sent. A briefing
+    /// that arrives blank on a client that will not render HTML is worse than
+    /// an unstyled one.
+    #[test]
+    fn html_without_text_is_invalid_params() {
+        for empty in ["", "   ", "\n\t "] {
+            let err = validate_send_bodies(&send_params(empty, Some("<p>x</p>")))
+                .expect_err("must be refused");
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert!(
+                err.message
+                    .contains("body_html requires a non-empty body_text"),
+                "unexpected message: {}",
+                err.message
+            );
+        }
+        // And the two cases that must still be accepted, so the guard is not
+        // simply refusing everything.
+        assert!(validate_send_bodies(&send_params("text", Some("<p>x</p>"))).is_ok());
+        assert!(validate_send_bodies(&send_params("", None)).is_ok());
+    }
 
     /// The owner must be matched against the account **Stalwart** reports, not
     /// against the Logto claim that reaches `owned_addresses` as an argument.
