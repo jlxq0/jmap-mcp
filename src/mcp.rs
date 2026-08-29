@@ -66,7 +66,7 @@ pub struct JmapMcpService {
     audit_registry: AuditMailboxRegistry,
     /// Operator-declared sendable addresses, merged into the mailbox's owned
     /// addresses. See `JMAP_MCP_EXTRA_FROM_ADDRESSES`.
-    extra_from_addresses: Arc<Vec<String>>,
+    extra_from_addresses: Arc<Vec<crate::config::OwnedFromAddress>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -84,7 +84,7 @@ impl JmapMcpService {
         download_max_bytes: u64,
         upload_max_bytes: usize,
         audit_registry: AuditMailboxRegistry,
-        extra_from_addresses: Arc<Vec<String>>,
+        extra_from_addresses: Arc<Vec<crate::config::OwnedFromAddress>>,
     ) -> Self {
         Self {
             jmap,
@@ -1516,19 +1516,68 @@ impl JmapMcpService {
         // alias, exactly as a discovered alias does. Role addresses are
         // already rejected at config-parse time; the filter here keeps that
         // guarantee local to the merge rather than at a distance.
-        for extra in self.extra_from_addresses.iter() {
-            if is_role_address(extra) {
-                continue;
-            }
-            if !out.iter().any(|a| a.email.eq_ignore_ascii_case(extra)) {
+        // Operator-declared addresses, scoped to the account that owns them.
+        //
+        // Before the owner existed this list was appended to every
+        // authenticated caller, so a second identity authenticating as itself
+        // was still handed the principal's alias as a sendable `From`. The
+        // match is against the session's own `username`, so a caller can only
+        // receive entries declared for the account it authenticated as.
+        //
+        // A caller whose session reports no username receives none of them:
+        // there is nothing to match, and granting on an absent field is how
+        // the flat list behaved.
+        // Authorisation matches against the account **Stalwart** says this
+        // credential is, not against `session_username`, which reaches here
+        // from the Logto JWT's `email` claim. A claim is asserted by the token;
+        // the session username is produced by the backend from the bearer. If
+        // the two ever disagree, matching the claim would hand one account's
+        // declared address to a caller authenticated as another.
+        //
+        // Found by Codex in review of this change, with the case spelled out:
+        // JMAP session `lucy@lindner.earth`, JWT claim `julian@kampong.social`,
+        // config `julian@kampong.social=julian@lindner.earth`.
+        let authenticated_as = self.jmap.session_for(token).await?.username;
+        for extra in
+            Self::extras_granted_to(authenticated_as.as_deref(), &self.extra_from_addresses)
+        {
+            if !out
+                .iter()
+                .any(|a| a.email.eq_ignore_ascii_case(&extra.email))
+            {
                 out.push(OwnedAddress {
-                    email: extra.clone(),
+                    email: extra.email.clone(),
                     identity_id: None,
                     name: None,
                 });
             }
         }
         Ok(out)
+    }
+
+    /// The operator-declared addresses a caller may put in `From`.
+    ///
+    /// Pure so the rule can be tested without a mail server, because it is the
+    /// rule and not the plumbing that decides whether one identity can send as
+    /// another. Before an owner existed this filter did not: the whole list was
+    /// appended to every authenticated caller, so declaring one account's alias
+    /// granted it to anybody who authenticated.
+    ///
+    /// A caller whose session reports **no** username receives nothing. There is
+    /// no owner to match, and granting on an absent field is precisely how the
+    /// flat list behaved.
+    fn extras_granted_to<'a>(
+        session_username: Option<&str>,
+        extras: &'a [crate::config::OwnedFromAddress],
+    ) -> Vec<&'a crate::config::OwnedFromAddress> {
+        let Some(user) = session_username else {
+            return Vec::new();
+        };
+        extras
+            .iter()
+            .filter(|e| !is_role_address(&e.email))
+            .filter(|e| user.eq_ignore_ascii_case(&e.owner))
+            .collect()
     }
 
     /// Raw `Identity/get` list.
@@ -1725,6 +1774,133 @@ impl ServerHandler for JmapMcpService {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The owner must be matched against the account **Stalwart** reports, not
+    /// against the Logto claim that reaches `owned_addresses` as an argument.
+    ///
+    /// Codex named the case in review: JMAP session `lucy@lindner.earth`, JWT
+    /// claim `julian@kampong.social`, config
+    /// `julian@kampong.social=julian@lindner.earth`. The claim is asserted by
+    /// the token; the session username is produced by the backend from the
+    /// bearer. This test feeds the attacker-favourable input deliberately.
+    #[tokio::test]
+    async fn a_logto_claim_cannot_borrow_another_accounts_from_address() {
+        use wiremock::matchers::{method as m, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(m("GET"))
+            .and(path("/.well-known/jmap"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiUrl": format!("{}/jmap/", server.uri()),
+                "downloadUrl": "d", "uploadUrl": "u",
+                "username": "lucy@lindner.earth",
+                "primaryAccounts": { CAP_MAIL: "acct-lucy" }
+            })))
+            .mount(&server)
+            .await;
+        // Every JMAP batch answers empty: no identities, and the optional
+        // alias extension absent, so the extras are the only remaining source.
+        Mock::given(m("POST"))
+            .and(path("/jmap/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "methodResponses": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let svc = JmapMcpService::new(
+            JmapClient::new(&server.uri(), None).unwrap(),
+            LogtoValidationClient::new("https://logto.example.test/oidc", "https://r.test".into())
+                .unwrap(),
+            Arc::new(Limiter::new(100_000, 100_000).unwrap()),
+            1024,
+            1024,
+            AuditMailboxRegistry::default(),
+            Arc::new(vec![crate::config::OwnedFromAddress {
+                owner: "julian@kampong.social".into(),
+                email: "julian@lindner.earth".into(),
+            }]),
+        );
+
+        // The third argument is the Logto claim, and it is a lie here.
+        let owned = svc
+            .owned_addresses("Bearer t", "acct-lucy", Some("julian@kampong.social"))
+            .await
+            .expect("session and empty batches are enough");
+
+        assert!(
+            !owned
+                .iter()
+                .any(|a| a.email.eq_ignore_ascii_case("julian@lindner.earth")),
+            "a claim naming another account must not grant that account's address; got {owned:?}"
+        );
+    }
+
+    use crate::config::OwnedFromAddress;
+
+    fn ofa(owner: &str, email: &str) -> OwnedFromAddress {
+        OwnedFromAddress {
+            owner: owner.into(),
+            email: email.into(),
+        }
+    }
+
+    fn granted(user: Option<&str>, extras: &[OwnedFromAddress]) -> Vec<String> {
+        JmapMcpService::extras_granted_to(user, extras)
+            .into_iter()
+            .map(|e| e.email.clone())
+            .collect()
+    }
+
+    /// The failure this replaced: one account's declared alias was handed to
+    /// every authenticated caller, so a second identity authenticating as
+    /// itself could still put the principal's address in `From`.
+    #[test]
+    fn a_declared_address_reaches_only_its_owner() {
+        let extras = vec![
+            ofa("julian@kampong.social", "julian@lindner.earth"),
+            ofa("lucy@lindner.earth", "lucy@kampong.social"),
+        ];
+        assert_eq!(
+            granted(Some("julian@kampong.social"), &extras),
+            vec!["julian@lindner.earth"]
+        );
+        assert_eq!(
+            granted(Some("lucy@lindner.earth"), &extras),
+            vec!["lucy@kampong.social"],
+            "she may send as herself"
+        );
+        assert!(
+            !granted(Some("lucy@lindner.earth"), &extras)
+                .contains(&"julian@lindner.earth".to_owned()),
+            "and not as him"
+        );
+    }
+
+    #[test]
+    fn owner_matching_is_case_insensitive() {
+        let extras = vec![ofa("julian@kampong.social", "julian@lindner.earth")];
+        assert_eq!(
+            granted(Some("Julian@Kampong.Social"), &extras),
+            vec!["julian@lindner.earth"]
+        );
+    }
+
+    /// No username means no owner to match, so nothing is granted. Granting on
+    /// an absent field is how the flat list behaved.
+    #[test]
+    fn a_session_without_a_username_is_granted_nothing() {
+        let extras = vec![ofa("julian@kampong.social", "julian@lindner.earth")];
+        assert!(granted(None, &extras).is_empty());
+    }
+
+    #[test]
+    fn an_unrelated_account_is_granted_nothing() {
+        let extras = vec![ofa("julian@kampong.social", "julian@lindner.earth")];
+        assert!(granted(Some("someone@else.test"), &extras).is_empty());
+    }
 
     fn owned(email: &str, identity: Option<&str>) -> OwnedAddress {
         OwnedAddress {

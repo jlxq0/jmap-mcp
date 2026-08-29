@@ -198,7 +198,9 @@ pub struct Config {
     /// Operator-declared addresses this mailbox may send as, in addition to
     /// the JMAP identities. Lower-cased, de-duplicated, and guaranteed free of
     /// role addresses by [`parse_extra_from_addresses`].
-    pub extra_from_addresses: Vec<String>,
+    pub extra_from_addresses: Vec<OwnedFromAddress>,
+    /// Declared addresses that name no owner. Granted to nobody; startup warns.
+    pub unowned_from_addresses: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -249,6 +251,7 @@ impl Config {
             dcr_client_id: None,
             oauth_redirect_uris: Vec::new(),
             extra_from_addresses: Vec::new(),
+            unowned_from_addresses: Vec::new(),
         })
     }
 
@@ -300,7 +303,9 @@ impl Config {
             .ok()
             .filter(|s| !s.trim().is_empty());
         cfg.oauth_redirect_uris = parse_redirect_uris_env()?;
-        cfg.extra_from_addresses = parse_extra_from_addresses_env()?;
+        let parsed = parse_extra_from_addresses_env()?;
+        cfg.extra_from_addresses = parsed.owned;
+        cfg.unowned_from_addresses = parsed.unowned;
 
         // Optional opaque-token introspection fallback credentials.
         if let (Ok(client_id), Ok(client_secret)) = (
@@ -411,10 +416,13 @@ fn parse_redirect_uris_env() -> Result<Vec<String>> {
     }
 }
 
-fn parse_extra_from_addresses_env() -> Result<Vec<String>> {
+fn parse_extra_from_addresses_env() -> Result<ParsedFromAddresses> {
     match std::env::var(ENV_EXTRA_FROM_ADDRESSES) {
         Ok(raw) => parse_extra_from_addresses(&raw),
-        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(std::env::VarError::NotPresent) => Ok(ParsedFromAddresses {
+            owned: Vec::new(),
+            unowned: Vec::new(),
+        }),
         Err(e) => Err(e).with_context(|| format!("invalid {ENV_EXTRA_FROM_ADDRESSES}")),
     }
 }
@@ -425,34 +433,89 @@ fn parse_extra_from_addresses_env() -> Result<Vec<String>> {
 /// that silently disappears is how an operator ends up believing an address is
 /// sendable when it is not. Role addresses are refused here as well as at send
 /// time, so a shared inbox cannot be turned into a personal `From` by config.
-pub fn parse_extra_from_addresses(raw: &str) -> Result<Vec<String>> {
-    let mut out: Vec<String> = Vec::new();
+/// An operator-declared From address and the account it belongs to.
+///
+/// The owner is not decoration. Before it existed these addresses were a flat
+/// list appended to **every** authenticated caller, so declaring one of
+/// Julian's aliases granted it to anybody who authenticated, including a
+/// second identity added later. The list could not express *she may send as
+/// herself and not as him*, which is the distinction the deployment actually
+/// needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedFromAddress {
+    /// The mail account this address belongs to, matched case-insensitively
+    /// against the JMAP session's `username`.
+    pub owner: String,
+    /// The address that account may put in `From`.
+    pub email: String,
+}
+
+/// Outcome of parsing `JMAP_MCP_EXTRA_FROM_ADDRESSES`.
+#[derive(Debug)]
+pub struct ParsedFromAddresses {
+    /// Entries of the form `owner@domain=address@domain`.
+    pub owned: Vec<OwnedFromAddress>,
+    /// Bare `address@domain` entries, which name no owner.
+    ///
+    /// **Granted to nobody**, and kept only so startup can say so. Honouring
+    /// them would restore the flat list this replaced; refusing to start would
+    /// take a live mail server down over a config line. Fail closed, stay up,
+    /// and name the fix.
+    pub unowned: Vec<String>,
+}
+
+fn parse_one_address(entry: &str, raw_entry: &str) -> Result<String> {
+    let addr = entry.trim().to_ascii_lowercase();
+    let mut parts = addr.split('@');
+    let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
+        anyhow::bail!(
+            "{ENV_EXTRA_FROM_ADDRESSES}: {raw_entry} is not a single user@domain address"
+        );
+    };
+    if local.is_empty() || domain.is_empty() || !domain.contains('.') {
+        anyhow::bail!("{ENV_EXTRA_FROM_ADDRESSES}: {raw_entry} is not a valid user@domain address");
+    }
+    // Checked here rather than on the granted address alone, so an unowned
+    // entry is still refused loudly. Setting a role address aside quietly
+    // would keep it out of every caller's From and lose the error that says
+    // the operator asked for something forbidden.
+    if crate::mcp::is_role_address(&addr) {
+        anyhow::bail!(
+            "{ENV_EXTRA_FROM_ADDRESSES}: {raw_entry} is a shared role address and must never be \
+             configured as a personal From"
+        );
+    }
+    Ok(addr)
+}
+
+pub fn parse_extra_from_addresses(raw: &str) -> Result<ParsedFromAddresses> {
+    let mut owned: Vec<OwnedFromAddress> = Vec::new();
+    let mut unowned: Vec<String> = Vec::new();
     for entry in raw.split([',', '\n', '\r', '\t', ' ']) {
         let entry = entry.trim();
         if entry.is_empty() {
             continue;
         }
-        let addr = entry.to_ascii_lowercase();
-        let mut parts = addr.split('@');
-        let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
-            anyhow::bail!(
-                "{ENV_EXTRA_FROM_ADDRESSES}: {entry} is not a single user@domain address"
-            );
+        let Some((owner_raw, email_raw)) = entry.split_once('=') else {
+            // No owner. Parsed for its shape so a typo is still an error, then
+            // set aside ungranted.
+            let addr = parse_one_address(entry, entry)?;
+            if !unowned.contains(&addr) {
+                unowned.push(addr);
+            }
+            continue;
         };
-        if local.is_empty() || domain.is_empty() || !domain.contains('.') {
-            anyhow::bail!("{ENV_EXTRA_FROM_ADDRESSES}: {entry} is not a valid user@domain address");
-        }
-        if crate::mcp::is_role_address(&addr) {
-            anyhow::bail!(
-                "{ENV_EXTRA_FROM_ADDRESSES}: {entry} is a shared role address and must never be \
-                 configured as a personal From"
-            );
-        }
-        if !out.contains(&addr) {
-            out.push(addr);
+        let account = parse_one_address(owner_raw, entry)?;
+        let email = parse_one_address(email_raw, entry)?;
+        let candidate = OwnedFromAddress {
+            owner: account,
+            email,
+        };
+        if !owned.contains(&candidate) {
+            owned.push(candidate);
         }
     }
-    Ok(out)
+    Ok(ParsedFromAddresses { owned, unowned })
 }
 
 /// Parse a boolean env var. Absent is `false`; only the exact strings below are
@@ -490,22 +553,53 @@ fn strip_trailing_slash(mut s: String) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod extra_from_address_tests {
-    use super::parse_extra_from_addresses;
+    use super::{OwnedFromAddress, parse_extra_from_addresses};
+
+    fn owned(owner: &str, email: &str) -> OwnedFromAddress {
+        OwnedFromAddress {
+            owner: owner.into(),
+            email: email.into(),
+        }
+    }
 
     #[test]
     fn parses_separated_and_normalises() {
-        let out = parse_extra_from_addresses("Julian@Lindner.Earth, jl@lindner.sg\n jl@lindner.sg")
-            .expect("valid list");
-        assert_eq!(out, vec!["julian@lindner.earth", "jl@lindner.sg"]);
+        let out = parse_extra_from_addresses(
+            "Julian@Kampong.Social=Julian@Lindner.Earth, julian@kampong.social=jl@lindner.sg\n \
+             julian@kampong.social=jl@lindner.sg",
+        )
+        .expect("valid list");
+        assert_eq!(
+            out.owned,
+            vec![
+                owned("julian@kampong.social", "julian@lindner.earth"),
+                owned("julian@kampong.social", "jl@lindner.sg"),
+            ]
+        );
+        assert!(out.unowned.is_empty());
     }
 
     #[test]
     fn empty_is_empty() {
-        assert!(parse_extra_from_addresses("   ,,\n ").unwrap().is_empty());
+        let out = parse_extra_from_addresses("   ,,\n ").unwrap();
+        assert!(out.owned.is_empty() && out.unowned.is_empty());
+    }
+
+    /// A bare address names no owner, so it is granted to nobody rather than
+    /// to everybody. Granting it to everybody is what this change removes.
+    #[test]
+    fn an_entry_without_an_owner_is_granted_to_nobody() {
+        let out = parse_extra_from_addresses("julian@lindner.earth").expect("still valid syntax");
+        assert!(
+            out.owned.is_empty(),
+            "an unowned entry must not become a grant"
+        );
+        assert_eq!(out.unowned, vec!["julian@lindner.earth"]);
     }
 
     /// The whole point of the allowlist is that it cannot be used to turn a
-    /// shared inbox into a personal From.
+    /// shared inbox into a personal From, and that holds for an entry with no
+    /// owner too, where it would otherwise be set aside silently.
     #[test]
     fn role_addresses_are_refused() {
         for role in [
@@ -513,18 +607,20 @@ mod extra_from_address_tests {
             "TEAM@kampong.social",
             "postmaster@lindner.earth",
             "julian@lindner.earth, team@kampong.social",
+            "julian@kampong.social=team@kampong.social",
+            "team@kampong.social=julian@lindner.earth",
         ] {
             let err = parse_extra_from_addresses(role).expect_err("role address must be refused");
             assert!(
                 err.to_string().contains("role address"),
-                "unexpected error: {err}"
+                "unexpected error for {role}: {err}"
             );
         }
     }
 
     /// A malformed entry fails the whole configuration rather than vanishing:
     /// a silently dropped typo leaves the operator believing an address is
-    /// sendable when it is not.
+    /// sendable when it is not. Both halves of an owned entry are checked.
     #[test]
     fn malformed_entries_fail_loudly() {
         for bad in [
@@ -533,6 +629,10 @@ mod extra_from_address_tests {
             "@lindner.earth",
             "julian@",
             "julian@local",
+            "julian@kampong.social=notanemail",
+            "notanemail=julian@lindner.earth",
+            "=julian@lindner.earth",
+            "julian@kampong.social=",
         ] {
             assert!(
                 parse_extra_from_addresses(bad).is_err(),

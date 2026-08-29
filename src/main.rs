@@ -124,6 +124,17 @@ fn build_router(
         allowed_hosts.push(h);
     }
     let audit_registry = audit_mailbox::AuditMailboxRegistry::new();
+    // A declared From address that names no owner is granted to nobody. Say so
+    // at `warn`: prod runs at `info`, and a grant that silently stopped
+    // applying is exactly the kind of degradation this repository has been
+    // caught by before.
+    for addr in &cfg.unowned_from_addresses {
+        tracing::warn!(
+            address = %addr,
+            "JMAP_MCP_EXTRA_FROM_ADDRESSES entry names no owner and is granted to nobody; \
+             write it as owner@domain=address@domain"
+        );
+    }
     let extra_from_addresses = Arc::new(cfg.extra_from_addresses.clone());
     let mcp_service = StreamableHttpService::new(
         move || {

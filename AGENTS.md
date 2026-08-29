@@ -53,6 +53,27 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   encodes an external API's shape, cite the vendor schema in the test, and
   accept both shapes when the cost is a two-arm match.
 
+- **`JMAP_MCP_EXTRA_FROM_ADDRESSES` entries carry an owner, and an entry
+  without one is granted to nobody.** Write `owner@domain=address@domain`. The
+  owner is matched case-insensitively against the JMAP session's own
+  `username`, so a caller receives only the addresses declared for the account
+  it authenticated as.
+
+  Before the owner existed the list was a flat `Arc<Vec<String>>` appended to
+  **every** authenticated caller, while the other two sources of a sendable
+  `From` (`Identity/get` and `principal_aliases`) were caller-scoped. So one
+  account's declared alias was a sendable `From` for anybody who
+  authenticated, and the config could not express *she may send as herself and
+  not as him*. Found 2026-08-29 while adding a second identity, before that
+  identity had a working mount.
+
+  A bare entry is **not** an error and **not** a grant: the server starts,
+  warns once per entry naming the required form, and grants it to nobody.
+  Refusing to start would take a live mail server down over a config line;
+  honouring it would restore the flat list. It fails closed and stays up, and
+  the consequence is that the address stops being sendable until the manifest
+  names its owner.
+
 - **Optional-capability fallbacks must be logged at least at `warn`.**
   Principal alias discovery degraded to identities-only at `debug`, and prod
   runs at `info`, so the permanent failure was invisible for two releases.
