@@ -45,6 +45,27 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   for. Use `JmapSession::is_authenticated`: 200 **and** a non-empty `username`
   or a real entry in `primaryAccounts`.
 
+- **A mutation set that only edits function bodies cannot see whether the
+  function is called.** `send_email` gained a `validate_send_bodies` guard with
+  a test that exercised it and four mutations that each redded exactly one
+  test. Deleting the guard's **single call site** in the handler left all 187
+  green while HTML-with-empty-text sent in production. Every mutation targeted
+  a function body; none targeted reachability, so the set looked thorough and
+  had one whole class outside it. Found 2026-08-29 in review, not by the suite.
+
+  The repair is structural rather than a second test to remember: the check
+  moved **inside** `build_email_object`, which returns `Result`, so there is no
+  call to omit and the existing test reaches it through the one path the
+  handler uses. **An object builder that cannot construct an invalid object
+  beats a guard somebody has to call.**
+
+  What that still does not cover, stated because it is easy to believe
+  otherwise: the handler can call the builder and **discard** the error.
+  Replacing `?` with `unwrap_or_else(|_| json!({}))` reds nothing. Closing that
+  needs a test that drives the handler itself, and no unit test on either
+  function reaches it. Mutate the call site as well as the callee, and when a
+  mutation reds nothing say so rather than dropping it.
+
 - **A JSON shape asserted only against a hand-written fixture is not tested.**
   `aliases_of` read Stalwart's `aliases` as an object map; the real schema is a
   **list**, so `as_object()` returned `None` and the mailbox's aliases silently
