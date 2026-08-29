@@ -1527,7 +1527,20 @@ impl JmapMcpService {
         // A caller whose session reports no username receives none of them:
         // there is nothing to match, and granting on an absent field is how
         // the flat list behaved.
-        for extra in Self::extras_granted_to(session_username, &self.extra_from_addresses) {
+        // Authorisation matches against the account **Stalwart** says this
+        // credential is, not against `session_username`, which reaches here
+        // from the Logto JWT's `email` claim. A claim is asserted by the token;
+        // the session username is produced by the backend from the bearer. If
+        // the two ever disagree, matching the claim would hand one account's
+        // declared address to a caller authenticated as another.
+        //
+        // Found by Codex in review of this change, with the case spelled out:
+        // JMAP session `lucy@lindner.earth`, JWT claim `julian@kampong.social`,
+        // config `julian@kampong.social=julian@lindner.earth`.
+        let authenticated_as = self.jmap.session_for(token).await?.username;
+        for extra in
+            Self::extras_granted_to(authenticated_as.as_deref(), &self.extra_from_addresses)
+        {
             if !out
                 .iter()
                 .any(|a| a.email.eq_ignore_ascii_case(&extra.email))
@@ -1761,6 +1774,69 @@ impl ServerHandler for JmapMcpService {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The owner must be matched against the account **Stalwart** reports, not
+    /// against the Logto claim that reaches `owned_addresses` as an argument.
+    ///
+    /// Codex named the case in review: JMAP session `lucy@lindner.earth`, JWT
+    /// claim `julian@kampong.social`, config
+    /// `julian@kampong.social=julian@lindner.earth`. The claim is asserted by
+    /// the token; the session username is produced by the backend from the
+    /// bearer. This test feeds the attacker-favourable input deliberately.
+    #[tokio::test]
+    async fn a_logto_claim_cannot_borrow_another_accounts_from_address() {
+        use wiremock::matchers::{method as m, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(m("GET"))
+            .and(path("/.well-known/jmap"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiUrl": format!("{}/jmap/", server.uri()),
+                "downloadUrl": "d", "uploadUrl": "u",
+                "username": "lucy@lindner.earth",
+                "primaryAccounts": { CAP_MAIL: "acct-lucy" }
+            })))
+            .mount(&server)
+            .await;
+        // Every JMAP batch answers empty: no identities, and the optional
+        // alias extension absent, so the extras are the only remaining source.
+        Mock::given(m("POST"))
+            .and(path("/jmap/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "methodResponses": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let svc = JmapMcpService::new(
+            JmapClient::new(&server.uri(), None).unwrap(),
+            LogtoValidationClient::new("https://logto.example.test/oidc", "https://r.test".into())
+                .unwrap(),
+            Arc::new(Limiter::new(100_000, 100_000).unwrap()),
+            1024,
+            1024,
+            AuditMailboxRegistry::default(),
+            Arc::new(vec![crate::config::OwnedFromAddress {
+                owner: "julian@kampong.social".into(),
+                email: "julian@lindner.earth".into(),
+            }]),
+        );
+
+        // The third argument is the Logto claim, and it is a lie here.
+        let owned = svc
+            .owned_addresses("Bearer t", "acct-lucy", Some("julian@kampong.social"))
+            .await
+            .expect("session and empty batches are enough");
+
+        assert!(
+            !owned
+                .iter()
+                .any(|a| a.email.eq_ignore_ascii_case("julian@lindner.earth")),
+            "a claim naming another account must not grant that account's address; got {owned:?}"
+        );
+    }
 
     use crate::config::OwnedFromAddress;
 
