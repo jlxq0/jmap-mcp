@@ -138,8 +138,8 @@ impl JmapMcpService {
         let token = token_from_ctx(ctx);
         // The cached JMAP session was discovered with a credential Stalwart
         // has now refused; drop it either way so the next call re-discovers.
-        if let Some(AccessToken(token)) = &token {
-            self.jmap.evict(token);
+        if let Some(token) = &token {
+            self.jmap.evict(&token.header_value());
         }
 
         if identity_from_ctx(ctx).is_some_and(|id| token_is_live(id.exp)) {
@@ -163,8 +163,8 @@ impl JmapMcpService {
 
         // Genuinely expired: forget the cached validation so the next
         // presentation of this token is re-checked from scratch.
-        if let Some(AccessToken(token)) = &token {
-            self.logto.drop_token(token);
+        if let Some(token) = &token {
+            self.logto.drop_token(token.secret());
         }
         *err = ErrorData::new(
             rmcp::model::ErrorCode(audit::AUTH_EXPIRED_CODE),
@@ -183,7 +183,7 @@ impl JmapMcpService {
     ) -> Result<(), ErrorData> {
         let token = token_from_ctx(ctx).ok_or_else(missing_token_err)?;
         let id = identity_from_ctx(ctx).ok_or_else(missing_identity_err)?;
-        let bearer_hash = audit::token_hash(&token.0);
+        let bearer_hash = audit::token_hash(token.secret());
         self.rate_limiter
             .check(&bearer_hash, Some(id.user_id.as_str()), category)
             .map_err(|_| {
@@ -929,7 +929,7 @@ impl JmapMcpService {
             // didn't carry it.
             let session = self
                 .jmap
-                .session_for(&token.0)
+                .session_for(&token.header_value())
                 .await
                 .map_err(map_jmap_err)?;
             let email = id
@@ -966,13 +966,17 @@ impl JmapMcpService {
         let (mut result, count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
             let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
             // Identities alone are not the mailbox's address list: personal
             // aliases have no Identity object, so they must be merged in or
             // they are invisible here and unusable as a From.
             let owned = self
-                .owned_addresses(&token.0, &account_id, session_email.as_deref())
+                .owned_addresses(&token.header_value(), &account_id, session_email.as_deref())
                 .await
                 .map_err(map_jmap_err)?;
             let mut identities: Vec<Identity> = owned
@@ -1024,8 +1028,14 @@ impl JmapMcpService {
         let (mut result, count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
-            let list = self.all_mailboxes(&token.0, &account_id).await?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
+            let list = self
+                .all_mailboxes(&token.header_value(), &account_id)
+                .await?;
             let mailboxes: Vec<MailboxSummary> = list
                 .iter()
                 .filter_map(|m| {
@@ -1077,14 +1087,14 @@ impl JmapMcpService {
         let (mut result, count) = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self.jmap.account_id(&token.header_value()).await.map_err(map_jmap_err)?;
             let limit = capped_email_limit(params.limit);
             // Email/query (filter by mailbox, sort newest-first) → Email/get
             // via back-reference, in one round-trip.
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL],
                     vec![
                         (
@@ -1186,11 +1196,15 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL],
                     vec![(
                         "Email/get",
@@ -1321,8 +1335,14 @@ impl JmapMcpService {
                 return Err(ErrorData::invalid_params("`to` must not be empty", None));
             }
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
-            let mailboxes = self.all_mailboxes(&token.0, &account_id).await?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
+            let mailboxes = self
+                .all_mailboxes(&token.header_value(), &account_id)
+                .await?;
             let drafts = Self::role_mailbox(&mailboxes, "drafts")
                 .ok_or_else(|| ErrorData::internal_error("no Drafts mailbox found", None))?;
             let sent = Self::role_mailbox(&mailboxes, "sent");
@@ -1333,7 +1353,7 @@ impl JmapMcpService {
             let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
             let from = self
                 .resolve_submission_identity(
-                    &token.0,
+                    &token.header_value(),
                     &account_id,
                     Some(&params.from),
                     &[],
@@ -1374,7 +1394,7 @@ impl JmapMcpService {
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL, CAP_SUBMISSION],
                     vec![
                         (
@@ -1653,7 +1673,7 @@ impl JmapMcpService {
         let jmap = self.jmap.clone();
         tokio::spawn(crate::audit_mailbox::emit_audit_message(
             jmap,
-            token.0,
+            token.header_value(),
             mailbox_id,
             from,
             method,

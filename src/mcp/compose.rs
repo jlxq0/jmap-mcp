@@ -164,15 +164,15 @@ impl JmapMcpService {
                 return Err(ErrorData::invalid_params("`to` must not be empty", None));
             }
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
-            let mailboxes = self.all_mailboxes(&token.0, &account_id).await?;
+            let account_id = self.jmap.account_id(&token.header_value()).await.map_err(map_jmap_err)?;
+            let mailboxes = self.all_mailboxes(&token.header_value(), &account_id).await?;
             let drafts = Self::role_mailbox(&mailboxes, "drafts")
                 .ok_or_else(|| ErrorData::internal_error("no Drafts mailbox found", None))?;
             let sent = Self::role_mailbox(&mailboxes, "sent");
             let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
             let from = self
                 .resolve_submission_identity(
-                    &token.0,
+                    &token.header_value(),
                     &account_id,
                     Some(&params.from),
                     &[],
@@ -194,7 +194,7 @@ impl JmapMcpService {
                     })?;
                 let blob = self
                     .jmap
-                    .upload_blob(&token.0, bytes, &att.mime_type)
+                    .upload_blob(&token.header_value(), bytes, &att.mime_type)
                     .await
                     .map_err(map_jmap_err)?;
                 attachment_objs.push(json!({
@@ -232,7 +232,7 @@ impl JmapMcpService {
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL, CAP_SUBMISSION],
                     vec![
                         (
@@ -306,8 +306,8 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
-            let mailboxes = self.all_mailboxes(&token.0, &account_id).await?;
+            let account_id = self.jmap.account_id(&token.header_value()).await.map_err(map_jmap_err)?;
+            let mailboxes = self.all_mailboxes(&token.header_value(), &account_id).await?;
             let drafts = Self::role_mailbox(&mailboxes, "drafts")
                 .ok_or_else(|| ErrorData::internal_error("no Drafts mailbox found", None))?;
             let sent = Self::role_mailbox(&mailboxes, "sent");
@@ -315,7 +315,7 @@ impl JmapMcpService {
             // Fetch the parent's envelope + threading headers.
             let parent = self
                 .get_email(
-                    &token.0,
+                    &token.header_value(),
                     &account_id,
                     &params.email_id,
                     &["from", "to", "cc", "subject", "messageId", "references"],
@@ -345,7 +345,7 @@ impl JmapMcpService {
             let addressed_to = parent_addressed_identities(&parent);
             let from = self
                 .resolve_submission_identity(
-                    &token.0,
+                    &token.header_value(),
                     &account_id,
                     params.from.as_deref(),
                     &addressed_to,
@@ -397,7 +397,7 @@ impl JmapMcpService {
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL, CAP_SUBMISSION],
                     vec![
                         (
@@ -473,8 +473,8 @@ impl JmapMcpService {
                 return Err(ErrorData::invalid_params("`to` must not be empty", None));
             }
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
-            let mailboxes = self.all_mailboxes(&token.0, &account_id).await?;
+            let account_id = self.jmap.account_id(&token.header_value()).await.map_err(map_jmap_err)?;
+            let mailboxes = self.all_mailboxes(&token.header_value(), &account_id).await?;
             let drafts = Self::role_mailbox(&mailboxes, "drafts")
                 .ok_or_else(|| ErrorData::internal_error("no Drafts mailbox found", None))?;
             let sent = Self::role_mailbox(&mailboxes, "sent");
@@ -482,7 +482,7 @@ impl JmapMcpService {
             // Fetch the parent (envelope + text body for the quote).
             let parent = self
                 .get_email(
-                    &token.0,
+                    &token.header_value(),
                     &account_id,
                     &params.email_id,
                     &["from", "to", "subject", "textBody", "bodyValues"],
@@ -493,7 +493,7 @@ impl JmapMcpService {
             // the account's first identity (a shared `team@` role address).
             let from = self
                 .resolve_submission_identity(
-                    &token.0,
+                    &token.header_value(),
                     &account_id,
                     params.from.as_deref(),
                     &[],
@@ -548,7 +548,7 @@ impl JmapMcpService {
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL, CAP_SUBMISSION],
                     vec![
                         (
@@ -619,8 +619,14 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
-            let mailboxes = self.all_mailboxes(&token.0, &account_id).await?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
+            let mailboxes = self
+                .all_mailboxes(&token.header_value(), &account_id)
+                .await?;
             let drafts = Self::role_mailbox(&mailboxes, "drafts")
                 .ok_or_else(|| ErrorData::internal_error("no Drafts mailbox found", None))?;
 
@@ -634,7 +640,7 @@ impl JmapMcpService {
             let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
             let from = self
                 .resolve_submission_identity(
-                    &token.0,
+                    &token.header_value(),
                     &account_id,
                     Some(&params.from),
                     &[],
@@ -658,7 +664,7 @@ impl JmapMcpService {
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL],
                     vec![(
                         "Email/set",
@@ -707,7 +713,11 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
 
             let mut patch = serde_json::Map::new();
             if let Some(from) = &params.from {
@@ -717,7 +727,7 @@ impl JmapMcpService {
                 let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
                 let from = self
                     .resolve_submission_identity(
-                        &token.0,
+                        &token.header_value(),
                         &account_id,
                         Some(from),
                         &[],
@@ -753,7 +763,7 @@ impl JmapMcpService {
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL],
                     vec![(
                         "Email/set",

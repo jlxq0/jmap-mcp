@@ -181,11 +181,15 @@ impl JmapMcpService {
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Read)?;
             let token = token_from_ctx(&ctx).ok_or_else(missing_token_err)?;
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL],
                     vec![(
                         "Email/get",
@@ -247,7 +251,7 @@ impl JmapMcpService {
             let bytes = self
                 .jmap
                 .download_blob(
-                    &token.0,
+                    &token.header_value(),
                     &params.attachment_id,
                     &content_type,
                     &raw_filename,
@@ -314,7 +318,7 @@ impl JmapMcpService {
             let (bytes, content_type) = fetch_capped(&validated_url, self.upload_max_bytes).await?;
             let uploaded = self
                 .jmap
-                .upload_blob(&token.0, bytes, &content_type)
+                .upload_blob(&token.header_value(), bytes, &content_type)
                 .await
                 .map_err(map_jmap_err)?;
 
@@ -372,8 +376,14 @@ impl JmapMcpService {
                 .await
                 .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
 
-            let account_id = self.jmap.account_id(&token.0).await.map_err(map_jmap_err)?;
-            let mailboxes = self.all_mailboxes(&token.0, &account_id).await?;
+            let account_id = self
+                .jmap
+                .account_id(&token.header_value())
+                .await
+                .map_err(map_jmap_err)?;
+            let mailboxes = self
+                .all_mailboxes(&token.header_value(), &account_id)
+                .await?;
             let drafts = Self::role_mailbox(&mailboxes, "drafts")
                 .ok_or_else(|| ErrorData::internal_error("no Drafts mailbox found", None))?;
             let sent = Self::role_mailbox(&mailboxes, "sent");
@@ -381,7 +391,7 @@ impl JmapMcpService {
             let session_email = identity_from_ctx(&ctx).and_then(|i| i.email);
             let from = self
                 .resolve_submission_identity(
-                    &token.0,
+                    &token.header_value(),
                     &account_id,
                     Some(&params.from),
                     &[],
@@ -393,7 +403,7 @@ impl JmapMcpService {
             let (bytes, content_type) = fetch_capped(&validated_url, self.upload_max_bytes).await?;
             let uploaded = self
                 .jmap
-                .upload_blob(&token.0, bytes, &content_type)
+                .upload_blob(&token.header_value(), bytes, &content_type)
                 .await
                 .map_err(map_jmap_err)?;
             let blob_id = uploaded.blob_id.clone();
@@ -426,7 +436,7 @@ impl JmapMcpService {
             let resps = self
                 .jmap
                 .call(
-                    &token.0,
+                    &token.header_value(),
                     &[CAP_CORE, CAP_MAIL, CAP_SUBMISSION],
                     vec![
                         (
