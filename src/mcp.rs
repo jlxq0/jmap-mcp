@@ -909,13 +909,26 @@ pub struct SendEmailParams {
     pub in_reply_to: Option<String>,
 }
 
-/// Refuse an HTML body with no plain-text alternative.
+/// Build the JMAP `Email` object for a send.
 ///
-/// A briefing that arrives blank on a client that will not render HTML is
-/// worse than an unstyled one, and a caller composing the HTML is exactly the
-/// caller who will forget the fallback. Structural rather than left to
-/// whoever composes.
-fn validate_send_bodies(params: &SendEmailParams) -> Result<(), ErrorData> {
+/// Extracted so the wire shape can be asserted without a mail server. The
+/// no-HTML branch must stay byte-identical to what was sent before
+/// `body_html` existed, which is a property a test can hold and a reading
+/// cannot.
+///
+/// The body validation lives **here**, not in a guard the handler calls.
+/// A separate guard is tested by testing the guard, and nothing holds that it
+/// is reached: deleting its one call site left all 187 tests green while
+/// HTML-with-empty-text sent in production. An object builder that cannot
+/// construct an invalid object needs no such call to be remembered.
+fn build_email_object(
+    params: &SendEmailParams,
+    drafts: &str,
+    from_header: &Value,
+) -> Result<Value, ErrorData> {
+    // A briefing that arrives blank on a client that will not render HTML is
+    // worse than an unstyled one, and the caller composing the HTML is the
+    // caller who forgets the fallback.
     if params.body_html.is_some() && params.body_text.trim().is_empty() {
         return Err(ErrorData::invalid_params(
             "body_html requires a non-empty body_text: clients that do not render HTML \
@@ -923,16 +936,6 @@ fn validate_send_bodies(params: &SendEmailParams) -> Result<(), ErrorData> {
             None,
         ));
     }
-    Ok(())
-}
-
-/// Build the JMAP `Email` object for a send.
-///
-/// Extracted so the wire shape can be asserted without a mail server. The
-/// no-HTML branch must stay byte-identical to what was sent before
-/// `body_html` existed, which is a property a test can hold and a reading
-/// cannot.
-fn build_email_object(params: &SendEmailParams, drafts: &str, from_header: &Value) -> Value {
     let to_addrs: Vec<Value> = params.to.iter().map(|e| json!({ "email": e })).collect();
     let cc_addrs: Vec<Value> = params.cc.iter().map(|e| json!({ "email": e })).collect();
     let bcc_addrs: Vec<Value> = params.bcc.iter().map(|e| json!({ "email": e })).collect();
@@ -962,7 +965,7 @@ fn build_email_object(params: &SendEmailParams, drafts: &str, from_header: &Valu
     if let Some(irt) = &params.in_reply_to {
         email_obj["inReplyTo"] = json!([irt]);
     }
-    email_obj
+    Ok(email_obj)
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -1398,7 +1401,6 @@ impl JmapMcpService {
         let span = make_tool_span("send_email", &user, None);
         let mut result = async {
             self.rate_limit_check(&ctx, Category::Write)?;
-            validate_send_bodies(&params)?;
             if params.to.is_empty() {
                 return Err(ErrorData::invalid_params("`to` must not be empty", None));
             }
@@ -1429,7 +1431,7 @@ impl JmapMcpService {
                 )
                 .await?;
 
-            let email_obj = build_email_object(&params, &drafts, &from.header());
+            let email_obj = build_email_object(&params, &drafts, &from.header())?;
 
             // onSuccessUpdateEmail: clear $draft, mark $seen, move to Sent.
             let mut patch = json!({ "keywords/$draft": null, "keywords/$seen": true });
@@ -1845,7 +1847,8 @@ mod tests {
             &send_params("plain only", None),
             "mb-drafts",
             &json!({ "email": "lucy@lindner.earth" }),
-        );
+        )
+        .expect("a text-only send is always valid");
         assert_eq!(
             obj,
             json!({
@@ -1869,7 +1872,8 @@ mod tests {
             &send_params("plain fallback", Some("<h1>Briefing</h1>")),
             "mb-drafts",
             &json!({ "email": "lucy@lindner.earth" }),
-        );
+        )
+        .expect("text plus html is valid");
 
         let values = obj["bodyValues"].as_object().expect("bodyValues object");
         assert_eq!(values.len(), 2, "one bodyValue per part");
@@ -1895,19 +1899,27 @@ mod tests {
             &send_params("t", Some(html)),
             "d",
             &json!({ "email": "a@b.test" }),
-        );
+        )
+        .expect("text plus html is valid");
         let part = obj["htmlBody"][0]["partId"].as_str().unwrap();
         assert_eq!(obj["bodyValues"][part]["value"], html);
     }
 
-    /// HTML with an empty text body is refused rather than sent. A briefing
-    /// that arrives blank on a client that will not render HTML is worse than
-    /// an unstyled one.
+    /// HTML with an empty text body is refused rather than sent.
+    ///
+    /// Goes through `build_email_object`, which is the one path the handler
+    /// uses, so this covers the wiring and not only the rule. As a separate
+    /// guard it did not: deleting the handler's single call to it left all 187
+    /// tests green while the invalid email sent.
     #[test]
     fn html_without_text_is_invalid_params() {
         for empty in ["", "   ", "\n\t "] {
-            let err = validate_send_bodies(&send_params(empty, Some("<p>x</p>")))
-                .expect_err("must be refused");
+            let err = build_email_object(
+                &send_params(empty, Some("<p>x</p>")),
+                "d",
+                &json!({ "email": "a@b.test" }),
+            )
+            .expect_err("must be refused");
             assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
             assert!(
                 err.message
@@ -1918,8 +1930,9 @@ mod tests {
         }
         // And the two cases that must still be accepted, so the guard is not
         // simply refusing everything.
-        assert!(validate_send_bodies(&send_params("text", Some("<p>x</p>"))).is_ok());
-        assert!(validate_send_bodies(&send_params("", None)).is_ok());
+        let from = json!({ "email": "a@b.test" });
+        assert!(build_email_object(&send_params("text", Some("<p>x</p>")), "d", &from).is_ok());
+        assert!(build_email_object(&send_params("", None), "d", &from).is_ok());
     }
 
     /// The owner must be matched against the account **Stalwart** reports, not
