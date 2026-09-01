@@ -378,7 +378,18 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   never been visible. That makes this repository the trap rather than the
   exception: somebody who learns "our MCP servers are single-manifest" from the
   other five and applies it here gets a confident mismatch on a correctly
-  deployed image, which is the sentence that triggers a rollback. Do not "simplify" this entry back to the fleet form.
+  deployed image, which is the sentence that triggers a rollback. Do not
+  "simplify" this entry back to the fleet form.
+
+  **The shape is also a provenance signal, which is a second use for the same
+  fact.** Every image this repository's CI builds is an index, because the
+  `buildctl` path attaches an attestation. So a **single-manifest** `jmap-mcp`
+  image did not come out of `.forgejo/workflows/ci.yml`. `v0.2.5` and `v0.2.6`
+  are single manifests, and that is a third independent signal beside their
+  absent OCI labels and the absence of any Actions run that could have built
+  them (issue 14). None of the three shares a failure mode with the others,
+  which is what makes them corroboration rather than one observation counted
+  three times.
 - A shell-level `RUSTUP_TOOLCHAIN` overrides `rust-toolchain.toml`. Verify the exact MSRV in CI, and pair version-new Clippy allowances with `unknown_lints` so the pinned compiler can still build.
 - **`RUSTUP_TOOLCHAIN` unset is not enough: mise's `rustc` shim resolves
   `stable` and ignores `rust-toolchain.toml`.** Measured 2026-08-27 with
