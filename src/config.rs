@@ -66,7 +66,7 @@ pub const ENV_UPLOAD_MAX_BYTES: &str = "JMAP_MCP_UPLOAD_MAX_BYTES";
 /// with the systems that produce it named beside it.
 ///
 /// **A deployment not behind that edge must override this.** A backend behind
-/// the LAN-only `home` gateway (`10.0.10.240`) sees **one** entry, and moving
+/// the LAN-only `home` gateway sees **one** entry, and moving
 /// between the two gateways changes the correct value with nothing reporting
 /// it.
 ///
@@ -105,13 +105,17 @@ pub const ENV_UPLOAD_MAX_BYTES: &str = "JMAP_MCP_UPLOAD_MAX_BYTES";
 /// *and from the LAN*, and answers only to code running inside the cluster.
 /// From one external host, with a same-moment control proving the path works:
 ///
-///     203.24.209.8:443   edge (Caddy)         OPEN
-///     203.24.209.5:443   cilium-gateway-web   timeout, 6s
-///     203.24.209.5:80    cilium-gateway-web   timeout, 6s
+///     203.0.113.21:443   edge (Caddy)         OPEN
+///     203.0.113.20:443   cilium-gateway-web   timeout, 6s
+///     203.0.113.20:80    cilium-gateway-web   timeout, 6s
 ///
-/// `fondue` holds `203.24.209.5/32` as a `MetalLB` `BGPAdvertisement` peered across
-/// `sgp`, `lax` and `zrh`; the L2 pool is `home-lan` on `10.0.10.240`. Nothing
-/// on the wifi has a route to it.
+/// `fondue` holds `203.0.113.20/32` as a `MetalLB` `BGPAdvertisement` peered
+/// across `sgp`, `lax` and `zrh`; the L2 pool is a different address on
+/// `home-lan`. Nothing on the wifi has a route to it.
+///
+/// The two addresses above are documentation-range stand-ins, so what the table
+/// shows is which of the two is reachable from outside and which is not, which
+/// is the whole of its point.
 ///
 /// **What would open it is one line in the deployment manifest.** This
 /// service's `HTTPRoute` has exactly one `parentRef`, `gateway/web`

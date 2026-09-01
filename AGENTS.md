@@ -354,8 +354,7 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
 - GitHub Actions (`.github/workflows/`) run equivalent public CI and publish a
   keylessly signed `ghcr.io/jlxq0/jmap-mcp:X.Y.Z` image plus an SPDX SBOM.
 - Live deployment is GitOps-managed by ArgoCD on **Fondue**, namespace
-  `jmap-mcp`. The manifest is
-  `/Users/jl/Code/oddie-apps/platform/clusters/fondue/jmap-mcp/deployment.yaml`
-  and images are pinned by tag **and digest**. Never use `kubectl set image`;
+  `jmap-mcp`. The manifest is `clusters/fondue/jmap-mcp/deployment.yaml` in the
+  `oddie-apps/platform` repository, and images are pinned by tag **and digest**. Never use `kubectl set image`;
   update the platform repository and wait for the `jmap-mcp` Argo application
   to report `Synced` and `Healthy`.
