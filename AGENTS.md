@@ -390,6 +390,59 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   them (issue 14). None of the three shares a failure mode with the others,
   which is what makes them corroboration rather than one observation counted
   three times.
+- **Attributing an image by rebuild-and-compare: the binary's `sha256` is the
+  only comparison that means anything.** Used 2026-09-02 to recover the source
+  of `v0.2.5` and `v0.2.6` (issue 14). Four things about the method, three of
+  which cost a wrong claim first.
+
+  **Compare the extracted binary, not the layer digest.** A `COPY` layer's
+  digest is over a tar carrying mtime, uid, gid and mode per entry, so a
+  byte-identical binary can land in a layer with a different digest for reasons
+  unrelated to the compiler. That is a false negative built into the
+  comparison.
+
+  **A matching *config* digest means the build did not happen.** It is the
+  inverse of how it first looked. The config is a document carrying per-layer
+  wall-clock times: `v0.2.5`'s has **23 history entries each with its own
+  `created`**, and the image itself `created 2026-08-16T09:31:54Z` against a
+  rebuild's `2026-09-02T02:26:59Z`. So an honest rebuild changes it **by
+  construction**, and a match can only happen when the layers *are* the
+  originals. **It is a cache detector, not a provenance check.**
+
+  **A rebuild identifies a tree, not a commit.** `8555a9c` and `c0a9353` share
+  tree `29637c1`, so `v0.2.6` is attributable to that tree and to neither
+  commit individually. Check `git rev-parse <a>^{tree}` against `<b>^{tree}`
+  before building, because nothing in the output says so afterwards and the
+  obvious write-up names one commit and is overprecise.
+
+  **Use `--no-cache`, and check the duration.** On a machine that has built the
+  image before, `docker build` reproduces nothing: the first candidate run
+  finished `rc=0 after 2.5s` against a genuine 79.4s, with the dep stub and the
+  source compile both `CACHED`. **A cache hit and a reproduction have the same
+  output and the same exit code**, so the duration is the only in-band signal,
+  and it is recorded in `~/Library/Logs/mantis-build-slot.log` rather than on
+  the wrapper's stderr, which is always empty. Read `Compiling jmap-mcp` and
+  the `CACHED` lines too.
+
+- **A dry run against a known state validates the method, not the
+  application.** The calibration for the above was `v0.2.14`, a pair whose
+  answer was already known, and it genuinely compiled and matched. **It could
+  not have caught the cache fault, because the property that made it honest is
+  the property the real subject lacked**: CI built `v0.2.14`, so this machine
+  held no cache for it, while `v0.2.5` and `v0.2.6` were built here and their
+  layers were sitting in 93 GB of it.
+
+  So the two differ wherever the known state and the subject differ, and
+  pointing a check at a state where you know the answer does not guard the run
+  that matters. **The instrument for the application is the cost of the run.**
+
+- **Ask of any second comparison what would have to be true for it to disagree
+  with the first.** If the answer is nothing, it is not a second comparison.
+  The config digest was offered as independent corroboration of a cache-hit
+  match, and it **can only pass in exactly the case it was offered to rule
+  out**. Two signals that fail together are one signal, and this recurred
+  inside the correction to the thing it was correcting.
+
 - A shell-level `RUSTUP_TOOLCHAIN` overrides `rust-toolchain.toml`. Verify the exact MSRV in CI, and pair version-new Clippy allowances with `unknown_lints` so the pinned compiler can still build.
 - **`RUSTUP_TOOLCHAIN` unset is not enough: mise's `rustc` shim resolves
   `stable` and ignores `rust-toolchain.toml`.** Measured 2026-08-27 with
