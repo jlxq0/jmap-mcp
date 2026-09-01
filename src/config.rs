@@ -109,9 +109,9 @@ pub const ENV_UPLOAD_MAX_BYTES: &str = "JMAP_MCP_UPLOAD_MAX_BYTES";
 ///     203.0.113.20:443   cilium-gateway-web   timeout, 6s
 ///     203.0.113.20:80    cilium-gateway-web   timeout, 6s
 ///
-/// `fondue` holds `203.0.113.20/32` as a `MetalLB` `BGPAdvertisement` peered
-/// across `sgp`, `lax` and `zrh`; the L2 pool is a different address on
-/// `home-lan`. Nothing on the wifi has a route to it.
+/// The cluster holds `203.0.113.20/32` as a `MetalLB` `BGPAdvertisement` peered
+/// across three edges; the L2 pool is a different address on `home-lan`.
+/// Nothing on the wifi has a route to it.
 ///
 /// The two addresses above are documentation-range stand-ins, so what the table
 /// shows is which of the two is reachable from outside and which is not, which
