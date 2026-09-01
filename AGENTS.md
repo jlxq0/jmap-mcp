@@ -45,6 +45,39 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   for. Use `JmapSession::is_authenticated`: 200 **and** a non-empty `username`
   or a real entry in `primaryAccounts`.
 
+- **A test that drives the handler through `oneshot` is the only kind that can
+  see a discarded `Result`, and the router must be cloned rather than
+  rebuilt.** `src/main.rs` tests build the real router and drive it, so a
+  `tools/call` reaches a handler through the same door a client uses. What that
+  buys: `#31` and the `body_html: None` residual from `#33` were both mutations
+  that **redded nothing** against every unit test, and both red now, because the
+  assertion is on what the caller receives rather than on what a function
+  returns.
+
+  Two details, and the second is the one that will bite:
+
+  `Request::builder()` sets no `Host` on a relative URI, so every call is
+  `400 Bad Request: missing Host header` until you set one.
+
+  **Clone the router; never build a second one.** A fresh `router(cfg)` is
+  identical in construction and shares **no** session manager, so `initialize`
+  returns `200` with a session id and the second call answers
+  `404 Session not found` — which reads as a session bug rather than as two
+  routers. `Router` being `Clone` is what makes the wrong version look correct,
+  because rebuilding is exactly what a careful person does to avoid shared
+  state. Same shape as a fixed name in a shared namespace, except the namespace
+  is one process and the two actors are two calls in one test. Mutation-checked:
+  rebuilding instead of cloning reds both handler tests on
+  `assertion left == right failed: tools/call transport`.
+
+  **And this is affordable only because of the app-password path.** Auth in the
+  harness is a Stalwart app password against a mock backend. Before that
+  existed an authenticated handler test needed a Logto-signed JWT, so it meant
+  mocking the JWKS, generating a key and signing a token. Two days of being
+  careful about widening the auth surface produced the thing that makes an
+  untested error path testable, and nobody planned it. **The next person
+  weighing a similar widening will see the cost and not this.**
+
 - **A mutation set that only edits function bodies cannot see whether the
   function is called.** `send_email` gained a `validate_send_bodies` guard with
   a test that exercised it and four mutations that each redded exactly one
@@ -338,11 +371,14 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   answer was already known, which is the point of dry-running a check against
   a known state before the moment it matters.
 
-  Why the fleet rule reads as it does: measured across the five deployed MCP
-  servers, `caldav-mcp`, `hevy-mcp`, `matrix-mcp` and `typst-mcp` all publish a
-  **single** manifest, where `-v` returns an object and the rule is correct.
-  `jmap-mcp` is the only index among them, so the precondition had never been
-  visible. Do not "simplify" this entry back to the fleet form.
+  Why the fleet rule reads as it does: measured across six deployed MCP
+  servers, `caldav-mcp`, `hevy-mcp`, `matrix-mcp`, `typst-mcp` and `m365-mcp`
+  all publish a **single** manifest, where `-v` returns an object and the rule
+  is correct. `jmap-mcp` is the only index among them, so the precondition had
+  never been visible. That makes this repository the trap rather than the
+  exception: somebody who learns "our MCP servers are single-manifest" from the
+  other five and applies it here gets a confident mismatch on a correctly
+  deployed image, which is the sentence that triggers a rollback. Do not "simplify" this entry back to the fleet form.
 - A shell-level `RUSTUP_TOOLCHAIN` overrides `rust-toolchain.toml`. Verify the exact MSRV in CI, and pair version-new Clippy allowances with `unknown_lints` so the pinned compiler can still build.
 - **`RUSTUP_TOOLCHAIN` unset is not enough: mise's `rustc` shim resolves
   `stable` and ignores `rust-toolchain.toml`.** Measured 2026-08-27 with
