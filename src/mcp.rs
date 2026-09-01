@@ -735,6 +735,51 @@ fn keywords_of(email: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Arguments for the `Email/get` behind `read_email`.
+///
+/// Extracted so the request can be asserted, not only the parsing of its
+/// reply. Asking for `htmlBody` and setting `fetchHTMLBodyValues` is what
+/// makes `extract_html_body` able to find anything, and a test on the
+/// extractor alone passes with both omitted: the read path then returns
+/// `body_html: None` for every email, including one that has an HTML part.
+fn read_email_get_args(account_id: &str, email_id: &str) -> Value {
+    json!({
+        "accountId": account_id,
+        "ids": [email_id],
+        "properties": ["from","to","cc","subject","receivedAt","keywords",
+                       "threadId","textBody","htmlBody","bodyValues",
+                       "attachments"],
+        "fetchTextBodyValues": true,
+        "fetchHTMLBodyValues": true,
+        "maxBodyValueBytes": MAX_BODY_VALUE_BYTES
+    })
+}
+
+/// Pull the HTML body out of an `Email/get` object fetched with
+/// `fetchHTMLBodyValues`, or `None` when the email has no HTML part.
+///
+/// **Deliberately no fallback to "the first available bodyValue"**, which is
+/// what `extract_text_body` does. There the fallback is harmless: any body
+/// value is closer to the text body than an empty string. Here it would return
+/// the *plain-text* part as `body_html` on a text-only email, so a caller
+/// checking whether its HTML arrived would be told yes for every message ever
+/// sent. `None` means no HTML part, and that has to stay distinguishable.
+fn extract_html_body(email: &Value) -> Option<String> {
+    let part_id = email
+        .get("htmlBody")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(|p| p.get("partId"))
+        .and_then(Value::as_str)?;
+    email
+        .get("bodyValues")
+        .and_then(Value::as_object)?
+        .get(part_id)
+        .and_then(|v| v.get("value"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
 /// Pull the plain-text body out of an `Email/get` object that was fetched
 /// with `fetchTextBodyValues`. Falls back to the first available bodyValue.
 fn extract_text_body(email: &Value) -> String {
@@ -873,6 +918,15 @@ pub struct ReadEmailResult {
     pub keywords: Vec<String>,
     /// Plain-text body, wrapped + sandboxed against prompt injection.
     pub body_text: String,
+    /// HTML body when the email has one, `None` when it does not.
+    ///
+    /// Sender-controlled and therefore covered by `untrusted_content` and by
+    /// the `suspicious` verdict, which is evaluated over this part as well as
+    /// the text one: a payload placed only in the HTML would otherwise be
+    /// invisible to the check. The markup is **not** rewritten, because
+    /// rewriting it would corrupt legitimate mail and the sandbox here works
+    /// by flagging rather than editing.
+    pub body_html: Option<String>,
     /// Heuristic flag: the body looks like a prompt-injection attempt.
     pub suspicious: bool,
     /// Body, envelope fields, and attachment names are external content.
@@ -1278,14 +1332,7 @@ impl JmapMcpService {
                     &[CAP_CORE, CAP_MAIL],
                     vec![(
                         "Email/get",
-                        json!({
-                            "accountId": account_id,
-                            "ids": [params.email_id],
-                            "properties": ["from","to","cc","subject","receivedAt","keywords",
-                                           "threadId","textBody","bodyValues","attachments"],
-                            "fetchTextBodyValues": true,
-                            "maxBodyValueBytes": MAX_BODY_VALUE_BYTES
-                        }),
+                        read_email_get_args(&account_id, &params.email_id),
                         "g",
                     )],
                 )
@@ -1303,6 +1350,13 @@ impl JmapMcpService {
 
             let mut raw_body = extract_text_body(&email);
             truncate_text_body(&mut raw_body);
+            // Same byte cap and the same UTF-8-safe truncation as the text
+            // part: `String::truncate` at a byte offset panics on a multibyte
+            // boundary, and release builds abort.
+            let raw_html = extract_html_body(&email).map(|mut h| {
+                truncate_text_body(&mut h);
+                h
+            });
             let raw_from = addrs(&email, "from");
             let raw_to = addrs(&email, "to");
             let raw_cc = addrs(&email, "cc");
@@ -1313,6 +1367,24 @@ impl JmapMcpService {
                 Some(&params.email_id),
                 &raw_body,
             );
+            // The HTML part gets its own verdict, and only its `suspicious`
+            // flag is used. A payload placed *only* in the HTML would
+            // otherwise be invisible to a check that reads the text part.
+            //
+            // Evaluated separately rather than concatenated into the text
+            // input: `body_text` carries `verdict.wrapped`, so a combined
+            // input would put the markup inside the plain-text field. And the
+            // HTML itself is returned unwrapped, because the sandbox wrap is
+            // text delimiters and would stop it being valid HTML.
+            let html_suspicious = raw_html.as_deref().is_some_and(|html| {
+                crate::content_sandbox::evaluate(
+                    None,
+                    raw_from.first().map(String::as_str),
+                    Some(&params.email_id),
+                    html,
+                )
+                .suspicious
+            });
             let raw_attachment_names: Vec<String> = email
                 .get("attachments")
                 .and_then(Value::as_array)
@@ -1359,7 +1431,8 @@ impl JmapMcpService {
                 thread_id: str_field(&email, "threadId"),
                 keywords: keywords_of(&email),
                 body_text: verdict.wrapped,
-                suspicious: verdict.suspicious || envelope_suspicious,
+                body_html: raw_html,
+                suspicious: verdict.suspicious || html_suspicious || envelope_suspicious,
                 untrusted_content: true,
                 attachments,
             })
@@ -2558,6 +2631,90 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("<system>")
         );
+    }
+
+    /// The acceptance for #33: what `send_email` composes, the read path can
+    /// read back. Not "the field exists" — a test asserting `body_html` is a
+    /// field passes against a server that never populates it.
+    ///
+    /// `build_email_object` is the send path, and a JMAP `Email` carries the
+    /// same `bodyValues` / `textBody` / `htmlBody` shape going out as coming
+    /// back, so its output is a faithful stand-in for an `Email/get` result.
+    #[test]
+    fn html_composed_by_send_survives_the_read_path() {
+        let html = r#"<div style="color:#0a0"><a href="https://x.test?a=1&b=2">go</a></div>"#;
+        let sent = build_email_object(
+            &send_params("plain fallback", Some(html)),
+            "mb-drafts",
+            &json!({ "email": "lucy@lindner.earth" }),
+        )
+        .expect("text plus html is valid");
+
+        assert_eq!(
+            extract_html_body(&sent).as_deref(),
+            Some(html),
+            "the html part composed on the way out must come back byte-for-byte"
+        );
+        // And the plain part is still the plain part, not the markup.
+        assert_eq!(extract_text_body(&sent), "plain fallback");
+    }
+
+    /// The request has to ask for the part, or `extract_html_body` has nothing
+    /// to find and every email reads back `body_html: None`.
+    ///
+    /// This exists because removing `htmlBody` and `fetchHTMLBodyValues` from
+    /// the request redded **nothing** while three tests on the extractor
+    /// passed. The extraction was covered and the request was not, which is
+    /// the same shape as #31 one layer up.
+    #[test]
+    fn the_request_asks_for_the_html_part() {
+        let args = read_email_get_args("acct-1", "email-1");
+        let props: Vec<&str> = args["properties"]
+            .as_array()
+            .expect("properties array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(props.contains(&"htmlBody"), "properties must name htmlBody");
+        assert!(props.contains(&"textBody"), "and still name textBody");
+        assert!(props.contains(&"bodyValues"), "the values carry the bodies");
+        assert_eq!(args["fetchHTMLBodyValues"], json!(true));
+        assert_eq!(args["fetchTextBodyValues"], json!(true));
+        assert_eq!(args["accountId"], json!("acct-1"));
+        assert_eq!(args["ids"], json!(["email-1"]));
+    }
+
+    /// A text-only email has no HTML part, and that must stay distinguishable
+    /// from "the HTML did not arrive". A fallback to any available bodyValue
+    /// would answer `Some(the plain text)` here and tell a sender its markup
+    /// had gone out on every message ever sent.
+    #[test]
+    fn a_text_only_email_reads_back_no_html() {
+        let sent = build_email_object(
+            &send_params("plain only", None),
+            "mb-drafts",
+            &json!({ "email": "lucy@lindner.earth" }),
+        )
+        .expect("a text-only send is always valid");
+        assert_eq!(extract_html_body(&sent), None);
+        assert_eq!(extract_text_body(&sent), "plain only");
+    }
+
+    /// An inbound email whose parts are in the other order, and whose ids are
+    /// not the ones this server happens to choose. The read path must follow
+    /// `htmlBody[0].partId` rather than a position or a name.
+    #[test]
+    fn extract_html_body_follows_the_named_part_not_a_position() {
+        let e = json!({
+            "textBody": [ { "partId": "2", "type": "text/plain" } ],
+            "htmlBody": [ { "partId": "1", "type": "text/html" } ],
+            "bodyValues": {
+                "1": { "value": "<p>markup</p>" },
+                "2": { "value": "plain" }
+            }
+        });
+        assert_eq!(extract_html_body(&e).as_deref(), Some("<p>markup</p>"));
+        assert_eq!(extract_text_body(&e), "plain");
     }
 
     #[test]
