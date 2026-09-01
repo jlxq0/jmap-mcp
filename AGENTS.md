@@ -66,6 +66,36 @@ to Stalwart. Stateless. See `memory/` notes for deploy/auth wiring.
   function reaches it. Mutate the call site as well as the callee, and when a
   mutation reds nothing say so rather than dropping it.
 
+- **A stale tool description cannot be found by anyone who has used the
+  tool.** `send_email`'s read *"Send a plain-text email"* for a day after it
+  gained `body_html`, so the parameter's own tool advertised that its purpose
+  was impossible. It was found by the one person who could not be misled by it:
+  she had already called it successfully with `body_html`, so she flagged the
+  description of the tool she was **reading** and not the one she was **using**.
+
+  A description only misleads somebody who has not already done the thing, and
+  that is exactly the person who is not reviewing it. The cost is measured
+  rather than argued: the same reader had, two days earlier, read `read_email`'s
+  summary rather than its properties, told two people `body_html` did not
+  exist, and retracted. **A description that denies a capability is worse than
+  a missing feature, because a caller acts on it and stops looking.**
+
+  So when a tool gains a parameter, re-read the description of **that** tool,
+  and treat "I know it works" as the reason you are the wrong reader. Fixed in
+  v0.2.21; `#33`'s own release shipped with both descriptions stale.
+
+- **A fixture contains only what its author thought to put in it**, so a test
+  on your own output confirms the cases you predicted and cannot assert the
+  absence of damage you did not predict. The escaping in `read_email` was
+  tested against a fixture carrying a `style` attribute and an `&` in a query
+  string, both of which I had thought of. What established it was safe on real
+  mail was a reader checking her own composed briefing for **"no entity
+  anywhere I did not put there"** — an assertion no fixture can make.
+
+  Worth the distinction when a change touches sender-controlled content:
+  *"the styles came back"* is a predicted case, *"nothing came back that I did
+  not write"* is a different claim and the stronger one.
+
 - **A JSON shape asserted only against a hand-written fixture is not tested.**
   `aliases_of` read Stalwart's `aliases` as an object map; the real schema is a
   **list**, so `as_object()` returned `None` and the mailbox's aliases silently
