@@ -349,6 +349,8 @@ mod tests {
     use axum::http::{Request, header};
     use tower::ServiceExt;
 
+    use base64::Engine as _;
+
     use super::*;
 
     fn test_config() -> Config {
@@ -493,6 +495,234 @@ mod tests {
                 "initialize {i} should not be throttled"
             );
         }
+    }
+
+    // ----- handler harness -----
+    //
+    // Drives a real `tools/call` through the router so an assertion can be made
+    // on **what the caller receives**. A `?` discarded at a call site is
+    // invisible to a unit test on either function and visible to a request that
+    // gets a result where it should get an error, which is the whole of #31.
+    //
+    // Auth is a Stalwart app password against a mock backend. That is only
+    // possible because of #25: before the Basic path an authenticated handler
+    // test needed a Logto-signed JWT, so it meant mocking the JWKS, generating
+    // a key and signing a token. The widening we were careful about is what
+    // made the untested error path testable, and nobody planned that.
+
+    /// A JMAP mock that answers every method this server asks for in one
+    /// response. Each caller filters `methodResponses` by name, so one body
+    /// satisfies `Mailbox/get`, `Identity/get`, `Email/get` and the two `set`s
+    /// regardless of which was requested.
+    async fn mock_jmap(html_body: Option<&str>) -> wiremock::MockServer {
+        use wiremock::matchers::{method as wm, path as wp};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut body_values = serde_json::json!({ "b": { "value": "plain text" } });
+        let mut email = serde_json::json!({
+            "id": "email-1",
+            "from": [{ "email": "someone@example.test" }],
+            "to": [{ "email": "lucy@lindner.earth" }],
+            "subject": "hello",
+            "textBody": [{ "partId": "b", "type": "text/plain" }],
+            "attachments": []
+        });
+        if let Some(html) = html_body {
+            body_values["h"] = serde_json::json!({ "value": html });
+            email["htmlBody"] = serde_json::json!([{ "partId": "h", "type": "text/html" }]);
+        }
+        email["bodyValues"] = body_values;
+
+        Mock::given(wm("GET"))
+            .and(wp("/.well-known/jmap"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiUrl": format!("{}/jmap/", server.uri()),
+                "downloadUrl": "d", "uploadUrl": "u",
+                "username": "lucy@lindner.earth",
+                "primaryAccounts": { "urn:ietf:params:jmap:mail": "acct-1" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(wm("POST"))
+            .and(wp("/jmap/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "methodResponses": [
+                    ["Mailbox/get", { "list": [
+                        { "id": "mb-drafts", "role": "drafts", "name": "Drafts" },
+                        { "id": "mb-sent", "role": "sent", "name": "Sent" }
+                    ] }, "m"],
+                    ["Identity/get", { "list": [
+                        { "id": "id-1", "email": "lucy@lindner.earth", "name": "Lucy" }
+                    ] }, "i"],
+                    ["Email/get", { "list": [email] }, "g"],
+                    ["Email/set", { "created": { "d": { "id": "email-new" } } }, "s"],
+                    ["EmailSubmission/set", { "created": { "sub": { "id": "sub-1" } } }, "e"]
+                ]
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn harness_config(stalwart_uri: &str) -> Config {
+        let mut cfg = Config::new(
+            "https://jmap-mcp.example.test",
+            "https://login.example.test/oidc",
+            stalwart_uri,
+            SocketAddr::from(([0, 0, 0, 0], 3000)),
+        )
+        .unwrap();
+        cfg.allow_app_password = true;
+        cfg
+    }
+
+    fn mcp_request(basic: &str, session: Option<&str>, body: String) -> Request<Body> {
+        let mut rb = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            // `Request::builder()` sets no Host on a relative URI, and without
+            // one every call is `400 Bad Request: missing Host header`.
+            .header(header::HOST, "jmap-mcp.example.test")
+            .header(header::AUTHORIZATION, basic)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream");
+        if let Some(sid) = session {
+            rb = rb.header("mcp-session-id", sid);
+        }
+        rb.body(Body::from(body)).unwrap()
+    }
+
+    #[allow(clippy::panic)] // a harness fault, and the frame is the diagnosis
+    fn panic_on_empty(text: &str) -> &'static str {
+        panic!("no JSON-RPC payload in the SSE frame: {text}")
+    }
+
+    /// The JSON-RPC payload out of the `text/event-stream` frame.
+    async fn sse_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 512 * 1024)
+            .await
+            .expect("body");
+        let text = String::from_utf8_lossy(&bytes);
+        let data = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .find(|d| !d.trim().is_empty())
+            .unwrap_or_else(|| {
+                // An empty SSE frame here means the tool never answered, which
+                // is a harness fault rather than a result worth asserting on.
+                panic_on_empty(&text)
+            });
+        serde_json::from_str(data).expect("JSON-RPC in the SSE frame")
+    }
+
+    /// `initialize`, then one `tools/call`, returning the JSON-RPC response.
+    ///
+    /// **The router is cloned, never rebuilt.** A fresh `router(cfg)` is
+    /// identical in construction and shares no session manager, so the id
+    /// `initialize` returns is meaningless to it and the second call answers
+    /// `404 Session not found` — which reads as a session bug rather than as
+    /// two routers. `Router` being `Clone` is what makes the wrong version look
+    /// correct, because rebuilding is what a careful person does to avoid
+    /// shared state.
+    async fn call_tool(cfg: Config, tool: &str, args: serde_json::Value) -> serde_json::Value {
+        let basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("lucy@lindner.earth:app-password")
+        );
+        let app = router(cfg);
+
+        let init = app
+            .clone()
+            .oneshot(mcp_request(
+                &basic,
+                None,
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"harness","version":"1"}}}"#.to_owned(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(init.status(), StatusCode::OK, "initialize must succeed");
+        let sid = init
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("initialize returns a session id")
+            .to_owned();
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": tool, "arguments": args }
+        })
+        .to_string();
+        let resp = app
+            .clone()
+            .oneshot(mcp_request(&basic, Some(&sid), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "tools/call transport");
+        sse_json(resp).await
+    }
+
+    /// #31: the handler must not discard `build_email_object`'s error.
+    ///
+    /// Unit tests on `build_email_object` and on the guard both passed while
+    /// the handler's `?` was replaced with `unwrap_or_else`, because neither
+    /// reaches the call site. This asserts on what the caller receives.
+    #[tokio::test]
+    async fn send_email_with_html_and_empty_text_is_an_error_to_the_caller() {
+        let stalwart = mock_jmap(None).await;
+        let out = call_tool(
+            harness_config(&stalwart.uri()),
+            "send_email",
+            serde_json::json!({
+                "from": "lucy@lindner.earth",
+                "to": ["julian@lindner.earth"],
+                "subject": "Briefing",
+                "body_text": "   ",
+                "body_html": "<h1>Briefing</h1>"
+            }),
+        )
+        .await;
+
+        let is_error = out["result"]["isError"].as_bool();
+        let rpc_error = out.get("error").is_some();
+        assert!(
+            is_error == Some(true) || rpc_error,
+            "the caller must be told this was refused, got: {out}"
+        );
+        let rendered = out.to_string();
+        assert!(
+            rendered.contains("body_html requires a non-empty body_text"),
+            "and told why, got: {rendered}"
+        );
+    }
+
+    /// #33's reds-nothing: `body_html: None` in the handler's result.
+    ///
+    /// Three tests on `extract_html_body` and `read_email_html_body` passed
+    /// with the handler hard-coding `body_html: None`, because none of them
+    /// reached the assembly of `ReadEmailResult`.
+    #[tokio::test]
+    async fn read_email_returns_the_html_the_backend_served() {
+        let html = "<div style=\"color:#0a0\">briefing</div>";
+        let stalwart = mock_jmap(Some(html)).await;
+        let out = call_tool(
+            harness_config(&stalwart.uri()),
+            "read_email",
+            serde_json::json!({ "email_id": "email-1" }),
+        )
+        .await;
+
+        assert_eq!(
+            out["result"]["isError"].as_bool(),
+            Some(false),
+            "got: {out}"
+        );
+        assert_eq!(
+            out["result"]["structuredContent"]["body_html"].as_str(),
+            Some(html),
+            "the html the backend served must reach the caller, got: {out}"
+        );
     }
 
     #[tokio::test]
