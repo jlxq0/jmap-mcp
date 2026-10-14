@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
 }
 
 fn build_app(cfg: Config) -> Result<Router> {
-    let logto = LogtoValidationClient::new(&cfg.authorization_server, cfg.resource_url.clone())?;
+    let logto = LogtoValidationClient::from_config(&cfg)?;
     let jmap = JmapClient::new(
         &cfg.stalwart_jmap_base_url,
         cfg.stalwart_connect_ip.as_deref(),
@@ -149,21 +149,29 @@ fn build_router(
             ))
         },
         Arc::new(session::CappedSessionManager::new()),
-        StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
+        StreamableHttpServerConfig::default()
+            .with_stateful_mode(!cfg.stateless)
+            .with_allowed_hosts(allowed_hosts),
     );
-
-    let initialize_limiter = Arc::new(InitializeLimiter::new(
-        crate::rate_limit::INITIALIZE_REFILL_INTERVAL,
-        MAX_INITIALIZES_PER_IDENTITY,
-    ));
 
     let mcp_routes = Router::new()
         .nest_service("/mcp", mcp_service)
-        .route("/token/introspect", get(token_introspect::handler))
-        .layer(middleware::from_fn_with_state(
-            initialize_limiter,
+        .route("/token/introspect", get(token_introspect::handler));
+    // Stateless requests never create sessions and normally have no session
+    // header. The initialization quota would incorrectly throttle every call.
+    // Per-tool read/write quotas remain enforced by JmapMcpService.
+    let mcp_routes = if cfg.stateless {
+        mcp_routes
+    } else {
+        mcp_routes.layer(middleware::from_fn_with_state(
+            Arc::new(InitializeLimiter::new(
+                crate::rate_limit::INITIALIZE_REFILL_INTERVAL,
+                MAX_INITIALIZES_PER_IDENTITY,
+            )),
             initialize_rate_limit,
         ))
+    };
+    let mcp_routes = mcp_routes
         .layer(middleware::from_fn_with_state(
             auth_state.clone(),
             bearer_auth,
@@ -726,6 +734,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stateless_calls_without_session_header_keep_tool_quota() {
+        let stalwart = mock_jmap(None).await;
+        let mut cfg = harness_config(&stalwart.uri());
+        cfg.stateless = true;
+        // More than the session-creation burst, but bounded by the tool quota.
+        cfg.rate_limit_reads_per_min = MAX_INITIALIZES_PER_IDENTITY + 4;
+        let app = build_app(cfg).unwrap();
+        let basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("lucy@lindner.earth:app-password")
+        );
+        for id in 0..MAX_INITIALIZES_PER_IDENTITY + 5 {
+            let body = serde_json::json!({"jsonrpc":"2.0", "id":id,
+                "method":"tools/call", "params":{"name":"whoami","arguments":{}}})
+            .to_string();
+            let response = app
+                .clone()
+                .oneshot(mcp_request(&basic, None, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "call {id}");
+            assert!(response.headers().get("mcp-session-id").is_none());
+            let result = sse_json(response).await;
+            if id < MAX_INITIALIZES_PER_IDENTITY + 4 {
+                assert_eq!(result["result"]["isError"], false, "call {id}: {result}");
+            } else {
+                assert_eq!(
+                    result["error"]["code"],
+                    crate::audit::RATE_LIMITED_CODE,
+                    "{result}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stateful_initialization_still_enforces_session_quota() {
+        let stalwart = mock_jmap(None).await;
+        let app = build_app(harness_config(&stalwart.uri())).unwrap();
+        let basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("lucy@lindner.earth:app-password")
+        );
+        for id in 0..=MAX_INITIALIZES_PER_IDENTITY {
+            let body = serde_json::json!({"jsonrpc":"2.0", "id":id,
+                "method":"initialize", "params":{"protocolVersion":"2025-06-18",
+                "capabilities":{},"clientInfo":{"name":"quota-test","version":"1"}}})
+            .to_string();
+            let response = app
+                .clone()
+                .oneshot(mcp_request(&basic, None, body))
+                .await
+                .unwrap();
+            if id < MAX_INITIALIZES_PER_IDENTITY {
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(response.headers().contains_key("mcp-session-id"));
+            } else {
+                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn metadata_endpoint_is_public() {
         let app = router(test_config());
         let r = app
@@ -738,5 +809,108 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
+    }
+    fn security_router(mail_url: &str) -> Router {
+        let mut cfg = test_config();
+        cfg.stalwart_jmap_base_url = mail_url.into();
+        cfg.stateless = true;
+        let logto = crate::logto_oidc::tests::security_test_client();
+        let state = AuthState {
+            config: cfg.clone(),
+            logto: logto.clone(),
+            jmap: JmapClient::new(mail_url, None).unwrap(),
+            last_used: crate::last_used::LastUsedTracker::new(),
+        };
+        build_router(
+            cfg,
+            state,
+            JmapClient::new(mail_url, None).unwrap(),
+            logto,
+            Arc::new(crate::rate_limit::Limiter::new(100_000, 100_000).unwrap()),
+            5 * 1024 * 1024,
+            10 * 1024 * 1024,
+        )
+    }
+
+    fn security_request(method: &str, token: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri("/mcp")
+            .header(header::HOST, "jmap-mcp.example.test")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("mcp-protocol-version", "2025-03-26")
+            .header("mcp-session-id", "another-users-session")
+            .header("last-event-id", "0_0")
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn security_stateless_rejects_get_replay_and_delete_with_valid_token() {
+        let token = crate::logto_oidc::tests::security_test_token(
+            "bob",
+            crate::logto_oidc::tests::TEST_ISSUER,
+            "stalwart",
+        );
+        let app = security_router("https://mail.example.test");
+        for method in ["GET", "DELETE"] {
+            let response = app
+                .clone()
+                .oneshot(security_request(method, &token, ""))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+            assert!(response.headers().get("mcp-session-id").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn security_stateless_tools_use_each_requests_identity_despite_session_headers() {
+        use wiremock::matchers::{header as matches_header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let app = security_router(&server.uri());
+        for (id, user) in [(1, "alice"), (2, "bob")] {
+            let token = crate::logto_oidc::tests::security_test_token(
+                user,
+                crate::logto_oidc::tests::TEST_ISSUER,
+                "stalwart",
+            );
+            Mock::given(method("GET"))
+                .and(path("/.well-known/jmap"))
+                .and(matches_header("authorization", format!("Bearer {token}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "apiUrl": format!("{}/jmap", server.uri()),
+                    "downloadUrl": format!("{}/download", server.uri()),
+                    "uploadUrl": format!("{}/upload", server.uri()),
+                    "primaryAccounts": {"urn:ietf:params:jmap:mail": format!("account-{user}")},
+                    "username": format!("{user}@example.test")
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let body = serde_json::json!({"jsonrpc":"2.0", "id":id,
+                "method":"tools/call", "params":{"name":"whoami","arguments":{}}})
+            .to_string();
+            let response = app
+                .clone()
+                .oneshot(security_request("POST", &token, &body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().get("mcp-session-id").is_none());
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(
+                text.contains(&format!("account-{user}")),
+                "missing per-request identity: {text}"
+            );
+            let other = if user == "alice" { "bob" } else { "alice" };
+            assert!(!text.contains(&format!("account-{other}")));
+        }
     }
 }

@@ -193,3 +193,57 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and
 ## License
 
 [MIT](LICENSE).
+
+## External OIDC validation behind a gateway
+
+An OAuth-aware gateway can handle client authorization, protected-resource
+metadata and token exchange, then send a backend access token to jmap-mcp.
+For example:
+
+```dotenv
+JMAP_MCP_RESOURCE_URL=https://mcp.your-domain.example
+JMAP_MCP_AUTHORIZATION_SERVER=https://auth.your-domain.example/tenant/
+JMAP_MCP_STALWART_JMAP_BASE_URL=https://mail.your-domain.example
+JMAP_MCP_OIDC_ISSUER=https://auth.your-domain.example/tenant/
+JMAP_MCP_OIDC_AUDIENCE=mail-backend-client-id
+JMAP_MCP_OIDC_JWKS_URL=https://auth.your-domain.example/tenant/jwks/
+JMAP_MCP_STATELESS=true
+```
+
+Set all three `JMAP_MCP_OIDC_*` variables together. Partial configuration,
+non-HTTPS issuer/JWKS URLs, URL credentials/fragments, issuer queries and an empty audience fail
+at startup. The issuer is matched exactly, including any trailing slash. JWT
+signature, issuer, audience, expiry and subject validation remain enabled.
+Stalwart must accept the same backend token and map its subject to the caller's
+mailbox. These settings do not implement token exchange or change the built-in
+Logto OAuth proxy: the gateway must serve discovery and authorization endpoints.
+Only expose jmap-mcp to that gateway, and leave its Logto DCR shim unconfigured.
+Keep `JMAP_MCP_ALLOW_STALWART_APP_PASSWORD=false` (the default) for a JWT-only
+backend. Enabling that separate option permits HTTP Basic app passwords; it
+never makes opaque Bearer tokens valid.
+
+`JMAP_MCP_STATELESS=true` creates a fresh MCP service for each POST, using that
+request's authenticated identity. It issues no MCP session ID and disables GET
+streams, DELETE and event replay. Supplied session headers on POST are ignored;
+they do not select another caller's session. Responses may still use SSE framing
+within the individual POST. Configure the gateway's MCP transport as stateless
+as well. Clients requiring
+session resumption or server-initiated streams cannot use this mode. Multiple
+replicas need no session affinity, although in-memory rate limits remain per
+process. Both overrides are opt-in: without them, existing Logto validation and
+stateful MCP transport retain their defaults.
+
+
+Issuer comparison follows [OpenID Connect Discovery 1.0 section 2](https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderMetadata): HTTPS,
+no query/fragment, and exact matching without trailing-slash normalization.
+The configured audience is checked against the JWT `aud` claim (RFC 7519
+section 4.1.3); the JWKS endpoint need not be a suffix of the issuer. This
+option configures validation of signed JWT **access tokens**, not acceptance
+of OIDC ID tokens as API credentials or support for every OAuth token format.
+Configure an access-token audience distinct from OIDC client IDs: no additional
+JWT `typ` check distinguishes ID tokens that share all accepted claims.
+It does not change RFC 8414/RFC 9728 metadata or the RFC 7591 registration
+shim. Those client-facing responsibilities remain with the gateway in this mode.
+
+Stateless mode bypasses the session-initialization quota because no sessions
+are allocated; the shared per-identity read/write tool quotas still apply.

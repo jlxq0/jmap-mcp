@@ -146,6 +146,20 @@ enum CachedKeyStatus {
 }
 
 impl LogtoValidationClient {
+    /// Build the request validator from the same configuration as the router.
+    pub fn from_config(cfg: &crate::config::Config) -> Result<Self> {
+        let client = Self::new(&cfg.authorization_server, cfg.resource_url.clone())?;
+        if let Some(validation) = &cfg.oidc_validation {
+            client.with_oidc_validation(
+                validation.issuer.clone(),
+                validation.audience.clone(),
+                validation.jwks_url.clone(),
+            )
+        } else {
+            Ok(client)
+        }
+    }
+
     /// Build a validation client. `authorization_server` is the Logto OIDC
     /// issuer base (`https://login.kampong.social/oidc`); the JWKS lives at
     /// `{issuer}/jwks` and the `iss` claim equals the issuer base exactly.
@@ -166,6 +180,25 @@ impl LogtoValidationClient {
             jwks_refresh: Arc::new(AsyncMutex::new(())),
             cache: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Configure an explicit OIDC issuer, audience, and JWKS endpoint.
+    /// Values are trusted deployment configuration, never request data.
+    pub fn with_oidc_validation(
+        mut self,
+        issuer: String,
+        audience: String,
+        jwks_url: String,
+    ) -> Result<Self> {
+        crate::config::OidcValidation::parse(
+            Some(issuer.clone()),
+            Some(audience.clone()),
+            Some(jwks_url.clone()),
+        )?;
+        self.expected_issuer = issuer;
+        self.expected_audience = audience;
+        self.jwks_url = jwks_url;
+        Ok(self)
     }
 
     /// Validate a bearer token. `Ok(Some(identity))` on a valid JWT for our
@@ -379,7 +412,7 @@ fn now_unix() -> i64 {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
+pub mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -460,5 +493,197 @@ mod tests {
             client.cache_insert(key, &identity, None);
         }
         assert_eq!(client.cache.read().unwrap().len(), CACHE_CAP);
+    }
+    #[test]
+    fn configured_validator_uses_independent_jwks_endpoint_and_exact_issuer() {
+        let mut cfg = crate::config::Config::new(
+            "https://mcp.example.test",
+            "https://login.example.test/oidc",
+            "https://mail.example.test",
+            "127.0.0.1:3000".parse().unwrap(),
+        )
+        .unwrap();
+        let default = LogtoValidationClient::from_config(&cfg).unwrap();
+        assert_eq!(default.expected_issuer, "https://login.example.test/oidc");
+        assert_eq!(default.expected_audience, "https://mcp.example.test");
+        assert_eq!(default.jwks_url, "https://login.example.test/oidc/jwks");
+        cfg.oidc_validation = crate::config::OidcValidation::parse(
+            Some("https://issuer.example.test/tenant/".into()),
+            Some("backend-api".into()),
+            Some("https://keys.example.test/signing.json?version=2".into()),
+        )
+        .unwrap();
+        let configured = LogtoValidationClient::from_config(&cfg).unwrap();
+        assert_eq!(
+            configured.expected_issuer,
+            "https://issuer.example.test/tenant/"
+        );
+        assert_eq!(configured.expected_audience, "backend-api");
+        assert_eq!(
+            configured.jwks_url,
+            "https://keys.example.test/signing.json?version=2"
+        );
+    }
+
+    // Public test fixture only; never used by production configuration.
+    const TEST_KEY: &str = "MIIEpQIBAAKCAQEAmbXeWS/CESvDJqGc+yRyPIWA5dO5jKTuKjaugzrOKxMwbquuGA2ClzX+rAIts/X2ix96LU3LVIeoB5/g351vyvMeOzUmiMDVWhOI8WnvOBhUqZJRwFGvNZi/1eQ03H7v5G0j2wzxu1wrA0qnoo/i9SdOmD4mNBjQxU8JlJ5Z6k59IE2EOoPo5rOqRWpE+dHH09ZKoH+rVyC9qogMEVY4RMWf/VsBPQpAlomQ82YDPWZSmdiDQyVhay7HLAIeiT8kzisaEPlh7RwHUaSMy7ubK4nI9SylxsZFW6uYmuiUy/pRzyCx1FzO6OC2DjrKEfRKJrZQf1dYkgeRN+wEHJspzQIDAQABAoIBAAH7DnjuvRz0h+i9B2VTFGfEPqN3hXoS/ACuQLRvMw3qCuM6Mh2cOvUQ3I3B323kuv8S8kOYL4kQ0HD8teybvj+Kv3Z62lrDxVwKSWb2+v6pjZm7yXLlepEBvWMXtDitKBE0+NPPSGQmLWW29g8JtJ59Ga2ri1l7gmEwggqYucbjo+qs7wWjN9tfqx3zFVSsQpR+nd1MV7G/DOkZW2xLHZgOeBrMNfkRGHfgsl0lhla3gpReb+0+b8KtpkhZYSr6GddKd9HRE52Yo7FazvBFQJKIKdbOlDFCQjsi5GYxZXkTU2fo9Q/iH45EwTwTkRd9/Kodx++D5TlhIkujzKzhZuECgYEAzOowBKUU37zwPlc18LVBiX9Tr3YSvzt5lxFmHp989llQI3UUT83bmphbh706y70qk8x1BfhwGYbHn0ZAVmJDdEJwCzB3Wf/gARiDEEtxTc1/5bg8z2DgsHyFQkXDIW8NNRY2ABBkZ5518omK/SWgk927zOIt0Hh/snEDiIDglxECgYEAwAfHzVEnpgJZBeOIqwoHwTVhACLvk7dkQuVxMP+0nKhLc/asnfMGxm/OeWuOC1Izxh1CqTEiaL9yiQ241Yip5ceBu0ayZuh1YZ78HIi4Y4/VVRNHv2ijzb3rNu6Yl7+BzpfDv+jloJ3WYHF/ZiQ7adztKQmV1LXXZBMeWIqT/v0CgYEAjFLGxTeC/uA0qIwyPP7yvUS7OwmhNuF0l1Xr14aiHVT2AwH3AdtXyhsRevfDnqeQ05uMe6UwptpcMx75ie5KgP/KGG99G92UOUve3La9BWl3bwlmYyDVXSY4XzTEtk2E/tiR7CNNjoO+A3PbARXWS8vpAhnVA9CwqbKol76hjfECgYEAkFuI/TUb/DVZnQ6up/2zVLB/Ci45Mi+0ZIG9dNtVeEsf5b4zh82xcy2L50VOk/4ow68tdKlmN55sSNGS+JtzNTSktxdvd+MakteEqSKyks4Gzpze2+qa8UjrcPEury0dNSRr2HIJZZQiG4BXCH8GVw/pDWeSRkSo9idVMbSDizUCgYEApkv53v/HhDQUuBPdapaDGSVPKdhh4mLAX5s6NYaGaRQ84n2fkek96tNg/Qx8pDJPZrghSNDxMqS0m9Uc4svb0mNQxPXJeSxdZDlOaYA+VxjhbKuauN/0BIpaB71Do3j0IqmjnGAbaqlaPd97tCK4VsA4NnzOH7cvr8FH9CYYR2U=";
+    const TEST_PUBLIC_KEY: &str = "MIIBCgKCAQEAmbXeWS/CESvDJqGc+yRyPIWA5dO5jKTuKjaugzrOKxMwbquuGA2ClzX+rAIts/X2ix96LU3LVIeoB5/g351vyvMeOzUmiMDVWhOI8WnvOBhUqZJRwFGvNZi/1eQ03H7v5G0j2wzxu1wrA0qnoo/i9SdOmD4mNBjQxU8JlJ5Z6k59IE2EOoPo5rOqRWpE+dHH09ZKoH+rVyC9qogMEVY4RMWf/VsBPQpAlomQ82YDPWZSmdiDQyVhay7HLAIeiT8kzisaEPlh7RwHUaSMy7ubK4nI9SylxsZFW6uYmuiUy/pRzyCx1FzO6OC2DjrKEfRKJrZQf1dYkgeRN+wEHJspzQIDAQAB";
+    pub const TEST_ISSUER: &str = "https://auth.example.test/tenant/";
+
+    pub fn security_test_client() -> LogtoValidationClient {
+        let client = LogtoValidationClient::new("https://unused.test", "old".into())
+            .unwrap()
+            .with_oidc_validation(
+                TEST_ISSUER.into(),
+                "stalwart".into(),
+                format!("{TEST_ISSUER}jwks/"),
+            )
+            .unwrap();
+        {
+            let mut keys = client.jwks.write().unwrap();
+            keys.keys.insert(
+                "test-key".into(),
+                DecodingKey::from_rsa_der(
+                    &base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        TEST_PUBLIC_KEY,
+                    )
+                    .unwrap(),
+                ),
+            );
+            keys.fetched_at = Some(Instant::now());
+        }
+        client
+    }
+
+    pub fn security_test_token(subject: &str, issuer: &str, audience: &str) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        signed_test_claims(&serde_json::json!({
+            "iss": issuer, "aud": audience, "sub": subject, "exp": now + 300
+        }))
+    }
+
+    fn signed_test_claims(claims: &serde_json::Value) -> String {
+        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+        header.kid = Some("test-key".into());
+        jsonwebtoken::encode(
+            &header,
+            claims,
+            &jsonwebtoken::EncodingKey::from_rsa_der(
+                &base64::Engine::decode(&base64::engine::general_purpose::STANDARD, TEST_KEY)
+                    .unwrap(),
+            ),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn oidc_override_requires_expiry_and_subject_and_accepts_audience_membership() {
+        let client = security_test_client();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = serde_json::json!({
+            "iss": TEST_ISSUER, "aud": ["another-api", "stalwart"],
+            "sub": "alice", "exp": now + 300
+        });
+        assert!(
+            client
+                .validate_token(&signed_test_claims(&claims))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        for missing in ["sub", "exp", "iss", "aud"] {
+            let mut invalid = claims.clone();
+            invalid.as_object_mut().unwrap().remove(missing);
+            assert!(
+                client
+                    .validate_token(&signed_test_claims(&invalid))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let mut expired = claims;
+        expired["exp"] = serde_json::json!(now - 300);
+        assert!(
+            client
+                .validate_token(&signed_test_claims(&expired))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn security_oidc_overrides_preserve_issuer_and_enforce_audience_and_signature() {
+        let client = security_test_client();
+        let valid = security_test_token("alice", TEST_ISSUER, "stalwart");
+        assert_eq!(
+            client
+                .validate_token(&valid)
+                .await
+                .unwrap()
+                .unwrap()
+                .user_id,
+            "alice"
+        );
+        for token in [
+            security_test_token("alice", TEST_ISSUER.trim_end_matches('/'), "stalwart"),
+            security_test_token("alice", TEST_ISSUER, "mcp-mail"),
+        ] {
+            assert!(client.validate_token(&token).await.unwrap().is_none());
+        }
+        let mut parts: Vec<String> = valid.split('.').map(str::to_owned).collect();
+        let first = if parts[2].starts_with('A') { "B" } else { "A" };
+        parts[2].replace_range(..1, first);
+        assert!(
+            client
+                .validate_token(&parts.join("."))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn security_oidc_overrides_reject_insecure_endpoints_and_empty_audience() {
+        for (issuer, audience, jwks) in [
+            ("http://auth.test/", "stalwart", "https://auth.test/jwks"),
+            (
+                "https://auth.test/?tenant=one",
+                "stalwart",
+                "https://auth.test/jwks",
+            ),
+            (
+                "https://auth.test/#fragment",
+                "stalwart",
+                "https://auth.test/jwks",
+            ),
+            (
+                "https://auth.test/",
+                "stalwart",
+                "https://auth.test/jwks#fragment",
+            ),
+            ("https://auth.test/", "stalwart", "http://auth.test/jwks"),
+            (
+                "https://user:password@auth.test/",
+                "stalwart",
+                "https://auth.test/jwks",
+            ),
+            ("https://auth.test/", " ", "https://auth.test/jwks"),
+        ] {
+            assert!(
+                LogtoValidationClient::new("https://unused.test", "old".into())
+                    .unwrap()
+                    .with_oidc_validation(issuer.into(), audience.into(), jwks.into())
+                    .is_err()
+            );
+        }
     }
 }
