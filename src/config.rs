@@ -161,8 +161,66 @@ const DEFAULT_DOWNLOAD_MAX_BYTES: u64 = 5 * 1024 * 1024;
 pub const DEFAULT_UPLOAD_MAX_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_TRUSTED_PROXY_HOPS: usize = 2;
 
+/// Explicit validation settings for a bearer token issued by an external gateway's identity provider.
+#[derive(Debug, Clone)]
+pub struct OidcValidation {
+    pub issuer: String,
+    pub audience: String,
+    pub jwks_url: String,
+}
+
+impl OidcValidation {
+    /// Parse the optional override group without accessing process environment.
+    pub fn parse(
+        issuer: Option<String>,
+        audience: Option<String>,
+        jwks_url: Option<String>,
+    ) -> Result<Option<Self>> {
+        match (issuer, audience, jwks_url) {
+            (None, None, None) => Ok(None),
+            (Some(issuer), Some(audience), Some(jwks_url)) => {
+                for (name, value) in [("issuer", &issuer), ("JWKS URL", &jwks_url)] {
+                    let url = reqwest::Url::parse(value)
+                        .with_context(|| format!("invalid OIDC {name}"))?;
+                    anyhow::ensure!(
+                        url.scheme() == "https" && url.host_str().is_some(),
+                        "OIDC {name} must use HTTPS"
+                    );
+                    anyhow::ensure!(
+                        url.username().is_empty()
+                            && url.password().is_none()
+                            && url.fragment().is_none(),
+                        "OIDC {name} must not contain credentials or a fragment"
+                    );
+                }
+                // OIDC Discovery 1.0 section 2: an issuer has no query component.
+                anyhow::ensure!(
+                    reqwest::Url::parse(&issuer)?.query().is_none(),
+                    "OIDC issuer must not contain a query"
+                );
+                anyhow::ensure!(
+                    !audience.trim().is_empty(),
+                    "OIDC audience must not be empty"
+                );
+                Ok(Some(Self {
+                    issuer,
+                    audience,
+                    jwks_url,
+                }))
+            }
+            _ => anyhow::bail!(
+                "set JMAP_MCP_OIDC_ISSUER, JMAP_MCP_OIDC_AUDIENCE and JMAP_MCP_OIDC_JWKS_URL together"
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Optional explicit issuer, audience and JWKS URL; default preserves Logto validation.
+    pub oidc_validation: Option<OidcValidation>,
+    /// Disable MCP sessions and GET/replay; default retains stateful transport.
+    pub stateless: bool,
     /// Our own public URL (e.g. `https://jmap-mcp.kampong.social`). Never
     /// trailing-slashed — RFC 8707 resource indicators are compared as
     /// strings.
@@ -239,6 +297,8 @@ impl Config {
         validate_url(&authorization_server, ENV_AUTH_SERVER_URL)?;
         validate_url(&stalwart_jmap_base_url, ENV_STALWART_JMAP_BASE_URL)?;
         Ok(Self {
+            oidc_validation: None,
+            stateless: false,
             resource_url,
             authorization_server,
             stalwart_jmap_base_url,
@@ -287,6 +347,12 @@ impl Config {
             stalwart_jmap_base_url,
             bind_addr,
         )?;
+        cfg.oidc_validation = OidcValidation::parse(
+            optional_env("JMAP_MCP_OIDC_ISSUER")?,
+            optional_env("JMAP_MCP_OIDC_AUDIENCE")?,
+            optional_env("JMAP_MCP_OIDC_JWKS_URL")?,
+        )?;
+        cfg.stateless = parse_bool_env("JMAP_MCP_STATELESS")?;
         cfg.metrics_bind_addr = metrics_bind_addr;
         cfg.rate_limit_reads_per_min =
             parse_rate_limit(ENV_RATE_LIMIT_READS, DEFAULT_RATE_LIMIT_READS)?;
@@ -337,6 +403,14 @@ fn resolve_metrics_bind_addr(
     );
     SocketAddr::from_str(&addr_str)
         .with_context(|| format!("invalid {ENV_METRICS_BIND_ADDR}: {addr_str}"))
+}
+
+fn optional_env(key: &str) -> Result<Option<String>> {
+    match std::env::var(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("{key} must contain valid Unicode"),
+    }
 }
 
 fn require_env(key: &str) -> Result<String> {
@@ -837,5 +911,36 @@ mod tests {
             resolve_metrics_bind_addr(None, None).unwrap().to_string(),
             "127.0.0.1:9090"
         );
+    }
+    #[test]
+    fn oidc_override_group_requires_all_fields() {
+        for mask in 0..8 {
+            let result = OidcValidation::parse(
+                (mask & 1 != 0).then(|| "https://auth.example.test/provider/".into()),
+                (mask & 2 != 0).then(|| "mail-backend".into()),
+                (mask & 4 != 0).then(|| "https://auth.example.test/provider/jwks/".into()),
+            );
+            match mask {
+                0 => assert!(result.unwrap().is_none()),
+                7 => assert_eq!(
+                    result.unwrap().unwrap().issuer,
+                    "https://auth.example.test/provider/"
+                ),
+                _ => assert!(result.is_err(), "partial override mask {mask} must fail"),
+            }
+        }
+    }
+
+    #[test]
+    fn default_transport_and_validation_remain_unchanged() {
+        let cfg = Config::new(
+            "https://mcp.example.test",
+            "https://auth.example.test/oidc",
+            "https://mail.example.test",
+            "127.0.0.1:3000".parse().unwrap(),
+        )
+        .unwrap();
+        assert!(!cfg.stateless);
+        assert!(cfg.oidc_validation.is_none());
     }
 }
