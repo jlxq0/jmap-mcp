@@ -240,6 +240,8 @@ The configured audience is checked against the JWT `aud` claim (RFC 7519
 section 4.1.3); the JWKS endpoint need not be a suffix of the issuer. This
 option configures validation of signed JWT **access tokens**, not acceptance
 of OIDC ID tokens as API credentials or support for every OAuth token format.
+Configure an access-token audience distinct from OIDC client IDs: no additional
+JWT `typ` check distinguishes ID tokens that share all accepted claims.
 It does not change RFC 8414/RFC 9728 metadata or the RFC 7591 registration
 shim. Those client-facing responsibilities remain with the gateway in this mode.
 
